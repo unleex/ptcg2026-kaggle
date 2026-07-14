@@ -167,12 +167,14 @@ action_log = [None]
 elo = EloRating()
 elo_data_path = weights_dir / "elo.json"
 if elo_data_path.exists():
+    print("Restoring elo from", elo_data_path)
     elo.load_json(elo_data_path)
 # The main training loop.
 if __name__ == "__main__":
     for counter in range(50):
         current_model_name = weights_dir / ("model" + str(counter) + ".pth")
         if current_model_name.exists():
+            print("Restoring ", current_model_name)
             model.load_state_dict(torch.load(open(current_model_name, mode="rb")))
         torch.save(model.state_dict(), current_model_name)  # Save the current model.
         elo.register(str(current_model_name))
@@ -193,15 +195,18 @@ if __name__ == "__main__":
                         torch.load(open(opponent_path, mode="rb"))
                     )
                     opponent_name = opponent_path
-                    opponent = Player(
-                        model=lambda obs: mcts_agent(obs, sample_deck, model)
-                    )
+
+                    def opponent(obs):
+                        return mcts_agent(obs, sample_deck, model)[0]
+
+                    opponent_deck = sample_deck
                 else:
                     opponent_name = "rule_based_lucario"
-                    opponent = Player(model=rule_based_lucario_agent)
+                    opponent = rule_based_lucario_agent
+                    opponent_deck = mega_lucario_ex_deck
                 elo.register(opponent_name)
 
-                obs, start_data = battle_start(sample_deck, sample_deck)
+                obs, start_data = battle_start(sample_deck, opponent_deck)
                 if start_data.errorPlayer >= 0:
                     error = "Deck error."
                     if start_data.errorType == 1:
@@ -222,7 +227,7 @@ if __name__ == "__main__":
                     if obs["current"]["yourIndex"] == your_index:
                         selected, _ = mcts_agent(obs, sample_deck, model)
                     else:
-                        selected, _ = opponent(obs)
+                        selected = opponent(obs)
                     obs_log.append(obs)
                     action_log.append(obs)
                     obs = battle_select(selected)
