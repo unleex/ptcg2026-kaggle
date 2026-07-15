@@ -1,6 +1,8 @@
 import json
 import random
 import sys
+import wandb
+from tqdm import tqdm
 
 import torch
 import torch.nn
@@ -62,21 +64,6 @@ class LearnInput:
         self.value.extend(sv.value)
         for o in sv.offset:
             self.offset.append(o + count)
-
-
-# For displaying progress.
-def progress(count: int, text: str):
-    current = 0
-    while True:
-        percent = 100 * current // count
-        sys.stderr.write(f"\r{text} {percent}%   ")
-        sys.stderr.flush()
-        if current >= count:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
-            break
-        yield current
-        current += 1
 
 
 # A sample deck for training.
@@ -173,7 +160,6 @@ def play_and_collect_samples(
     Returns
     samples: list of length 2: samples for player 1, and samples for player 2. If some player is not trainable, their samples will be empty
     obs: last observation that concludes the game
-    your_index: idk lol
     """
 
     obs_log = [""]
@@ -209,12 +195,13 @@ def play_and_collect_samples(
             selected, sample = player2(obs)
             if player2_is_trainable:
                 samples[obs["current"]["yourIndex"]].append(sample)
+
         obs_log.append(obs)
-        action_log.append(obs)
+        action_log.append(selected)
         obs = battle_select(selected)
 
     battle_finish()  # Finalize the game.
-    return samples, action_log, obs_log, obs, your_index
+    return samples, action_log, obs_log, obs
 
 
 def player1(obs):
@@ -225,6 +212,8 @@ player1_is_trainable = True
 
 # The main training loop.
 if __name__ == "__main__":
+    wandb.init(project="ptcg-rl", name="transformer-mcts-training")
+
     for counter in range(50):
         current_model_name = weights_dir / ("model" + str(counter) + ".pth")
         if current_model_name.exists():
@@ -241,7 +230,7 @@ if __name__ == "__main__":
             # Evaluation
             results = [0, 0, 0]
 
-            for i in progress(50, "Evaluating... "):
+            for i in tqdm(range(50), desc=f"Evaluating Epoch {counter}..."):
                 if i % 2 == 0:
                     player2_path = str(random.choice(list(weights_dir.iterdir())))
                     player2_model = transformer.MyModel(128, 2, 256, 1, 1)
@@ -266,15 +255,13 @@ if __name__ == "__main__":
                     player2_is_trainable = False
                 elo.register(player2_name)
 
-                _, action_log, obs_log, game_result, your_index = (
-                    play_and_collect_samples(
-                        player1=player1,
-                        player2=player2,
-                        deck1=sample_deck,
-                        deck2=player2_deck,
-                        player1_is_trainable=player1_is_trainable,
-                        player2_is_trainable=player2_is_trainable,
-                    )
+                _, action_log, obs_log, game_result = play_and_collect_samples(
+                    player1=player1,
+                    player2=player2,
+                    deck1=sample_deck,
+                    deck2=player2_deck,
+                    player1_is_trainable=player1_is_trainable,
+                    player2_is_trainable=player2_is_trainable,
                 )
 
                 # For visualiation
@@ -288,7 +275,7 @@ if __name__ == "__main__":
                 if game_result["current"]["result"] == 2:  # Draw
                     elo_our_score = 0.5
                     results[2] += 1
-                elif game_result["current"]["result"] == your_index:  # Win
+                elif game_result["current"]["result"] == 0:  # Win
                     elo_our_score = 1
                     results[0] += 1
                 else:  # Lose
@@ -299,16 +286,18 @@ if __name__ == "__main__":
                     name_b=str(player2_name),
                     a_score=elo_our_score,
                 )
-            print(
-                "Evaluation win rate "
-                + str(100 * results[0] // (results[0] + results[1]))
-                + "%",
-                flush=True,
+
+            win_rate = (
+                100 * results[0] // (results[0] + results[1])
+                if (results[0] + results[1]) > 0
+                else 0
             )
+            print(f"Evaluation win rate {win_rate}%", flush=True)
             print(elo.summary())
             elo.save_json(elo_data_path)
+
             # Self Play
-            for i in progress(100, "Training Data Collecting... "):
+            for i in tqdm(range(100), desc=f"Data Collecting Epoch {counter}..."):
                 if i % 2 == 0:
                     player2_path = str(random.choice(list(weights_dir.iterdir())))
                     player2_model = transformer.MyModel(128, 2, 256, 1, 1)
@@ -330,7 +319,7 @@ if __name__ == "__main__":
 
                     player2_deck = mega_lucario_ex_deck
 
-                samples, _, _, game_result, _ = play_and_collect_samples(
+                samples, _, _, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
                     deck1=sample_deck,
@@ -357,7 +346,11 @@ if __name__ == "__main__":
         random.shuffle(sample_list)
         BATCH_SIZE = 128
         batch_count = len(sample_list) // BATCH_SIZE
-        for i in range(batch_count):
+
+        epoch_loss_enc = 0.0
+        epoch_loss_dec = 0.0
+
+        for i in tqdm(range(batch_count), desc=f"Training Epoch {counter}..."):
             # Prepare a batch of data.
             input_enc = LearnInput()
             input_dec = LearnInput()
@@ -409,7 +402,30 @@ if __name__ == "__main__":
             loss_dec = loss_dec.sum() / float(BATCH_SIZE)
             loss = loss_enc + loss_dec
 
+            epoch_loss_enc += loss_enc.item()
+            epoch_loss_dec += loss_dec.item()
+
             # Backpropagate the loss and update model parameters.
             loss.backward()
             optimizer.step()
+
+        avg_loss_enc = epoch_loss_enc / batch_count if batch_count > 0 else 0
+        avg_loss_dec = epoch_loss_dec / batch_count if batch_count > 0 else 0
+
+        # Safely extract the ELO score from the EloRating dictionary if accessible
+        current_elo = getattr(elo, "rating_dict", getattr(elo, "ratings", {})).get(
+            str(current_model_name), 600
+        )
+
+        wandb.log(
+            {
+                "epoch": counter,
+                "eval_win_rate": win_rate,
+                "elo": current_elo,
+                "loss_encoder": avg_loss_enc,
+                "loss_decoder": avg_loss_dec,
+                "loss_total": avg_loss_enc + avg_loss_dec,
+            }
+        )
+
         print("Training Finish.")
