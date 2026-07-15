@@ -52,10 +52,6 @@ decoder_size = (
 )  # Decoder input vocabulary size
 
 
-vis_savedir = Path("visuals")
-vis_savedir.mkdir(exist_ok=True)
-
-
 # Helper class to construct batch inputs for the neural network.
 class LearnInput:
     index: list[int]
@@ -160,12 +156,18 @@ model = model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
 loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
-weights_dir = Path("out")
+results_dir = Path("results")
+results_dir.mkdir(exist_ok=True)
+weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
+vis_savedir = results_dir / Path("visuals")
+vis_savedir.mkdir(exist_ok=True)
+
+
 obs_log = [""]
 action_log = [None]
-elo = EloRating()
-elo_data_path = weights_dir / "elo.json"
+elo = EloRating(initial=600)
+elo_data_path = results_dir / "elo.json"
 if elo_data_path.exists():
     print("Restoring elo from", elo_data_path)
     elo.load_json(elo_data_path)
@@ -192,17 +194,21 @@ if __name__ == "__main__":
                     opponent_path = str(random.choice(list(weights_dir.iterdir())))
                     opponent_model = transformer.MyModel(128, 2, 256, 1, 1)
                     opponent_model.load_state_dict(
-                        torch.load(open(opponent_path, mode="rb"))
+                        torch.load(open(opponent_path, mode="rb"), weights_only=False)
                     )
                     opponent_name = opponent_path
 
                     def opponent(obs):
-                        return mcts_agent(obs, sample_deck, model)[0]
+                        return mcts_agent(obs, sample_deck, model)
 
                     opponent_deck = sample_deck
                 else:
                     opponent_name = "rule_based_lucario"
-                    opponent = rule_based_lucario_agent
+
+                    # Trainables return second item as LearnSample, this does not.
+                    def opponent(*args, **kwargs):
+                        return (rule_based_lucario_agent(*args, **kwargs), None)
+
                     opponent_deck = mega_lucario_ex_deck
                 elo.register(opponent_name)
 
@@ -227,7 +233,7 @@ if __name__ == "__main__":
                     if obs["current"]["yourIndex"] == your_index:
                         selected, _ = mcts_agent(obs, sample_deck, model)
                     else:
-                        selected = opponent(obs)
+                        selected, _ = opponent(obs)
                     obs_log.append(obs)
                     action_log.append(obs)
                     obs = battle_select(selected)
@@ -253,7 +259,7 @@ if __name__ == "__main__":
                     results[1] += 1
                 elo.update(
                     name_a=str(current_model_name),
-                    name_b=str(opponent_path),
+                    name_b=str(opponent_name),
                     a_score=elo_our_score,
                 )
             print(
@@ -265,37 +271,45 @@ if __name__ == "__main__":
             print(elo.summary())
             elo.save_json(elo_data_path)
             # Self Play
-            for _ in progress(100, "Training Data Collecting... "):
-                # Start against the rule-based deck
-                obs, _ = battle_start(sample_deck, mega_lucario_ex_deck)
-                samples: list[transformer.LearnSample] = []
+            for i in progress(100, "Training Data Collecting... "):
+                if i % 2 == 0:
+                    opponent_path = str(random.choice(list(weights_dir.iterdir())))
+                    opponent_model = transformer.MyModel(128, 2, 256, 1, 1)
+                    opponent_model.load_state_dict(
+                        torch.load(open(opponent_path, mode="rb"), weights_only=False)
+                    )
+                    opponent_name = opponent_path
 
+                    def opponent(obs):
+                        return mcts_agent(obs, sample_deck, model)
+
+                    opponent_deck = sample_deck
+                else:
+                    opponent_name = "rule_based_lucario"
+
+                    # Trainables return second item as LearnSample, this does not.
+                    def opponent(*args, **kwargs):
+                        return (rule_based_lucario_agent(*args, **kwargs), None)
+
+                    opponent_deck = mega_lucario_ex_deck
+                obs, _ = battle_start(sample_deck, opponent_deck)
+
+                samples: list[list[transformer.LearnSample]] = [
+                    [],
+                    [],
+                ]  # [Player0 samples, Player1 samples]
                 while True:
                     if obs["current"]["result"] >= 0:
                         break
-
                     your_index = obs["current"]["yourIndex"]
                     if your_index == 0:
                         # We play as index 0, generate MCTS actions and training samples
                         selected, sample = mcts_agent(obs, sample_deck, model)
-                        samples.append(sample)
+                        samples[obs["current"]["yourIndex"]].append(sample)
+
                     else:
-                        # Rule-based agent plays index 1, no samples generated
-                        selected = rule_based_lucario_agent(obs)
-
+                        selected, _ = opponent(obs)
                     obs = battle_select(selected)
-
-                battle_finish()
-
-                # Calculate labels for our collected samples
-                LAMBDA = 0.9
-                value = 1.0 if 0 == obs["current"]["result"] else -1.0
-
-                for sample in reversed(samples):
-                    label = (value + sample.value) * 0.5
-                    value = value * LAMBDA + sample.value * (1.0 - LAMBDA)
-                    sample.value = label
-                    sample_list.append(sample)
 
                 battle_finish()  # Finalize the game.
 
@@ -312,6 +326,7 @@ if __name__ == "__main__":
                         sample.value = label
                         sample_list.append(sample)
 
+        # Train on the training data collected through self-play.
         # Train on the training data collected through self-play.
         print("Training Start.")
         model.train()
