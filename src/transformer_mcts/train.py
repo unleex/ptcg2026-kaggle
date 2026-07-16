@@ -1,6 +1,5 @@
 import json
 import random
-import sys
 import wandb
 from tqdm import tqdm
 
@@ -9,12 +8,17 @@ import torch.nn
 import torch.optim
 from pathlib import Path
 
-from cg.api import (
+from kaggle_ptcg_engine.ptcg.cg.api import (
     SelectContext,
     all_attack,
     all_card_data,
 )
-from cg.game import battle_start, battle_finish, battle_select, visualize_data
+from kaggle_ptcg_engine.ptcg.cg.game import (
+    battle_start,
+    battle_finish,
+    battle_select,
+    visualize_data,
+)
 import transformer_mcts.transformer as transformer
 from transformer_mcts.mcts import mcts_agent
 from elo import EloRating
@@ -22,6 +26,13 @@ from rule_based_mega_lucario_ex.agent import (
     agent as rule_based_lucario_agent,
     my_deck as mega_lucario_ex_deck,
 )
+
+results_dir = Path("results_working")
+results_dir.mkdir(exist_ok=True)
+weights_dir = results_dir / Path("out")
+weights_dir.mkdir(exist_ok=True)
+vis_savedir = results_dir / Path("visuals")
+vis_savedir.mkdir(exist_ok=True)
 
 # Load all card data from the API's helper function
 all_card = all_card_data()
@@ -66,8 +77,85 @@ class LearnInput:
             self.offset.append(o + count)
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = transformer.MyModel(128, 2, 256, 1, 1)
+model = model.to(device)
+model_path = weights_dir / "model.pth"
+if model_path.exists():
+    print("Restoring", model_path)
+    model.load_state_dict(torch.load(model_path, weights_only=False))
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
+loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
+
+elo = EloRating(initial=600)
+elo_data_path = results_dir / "elo.json"
+if elo_data_path.exists():
+    print("Restoring elo from", elo_data_path)
+    elo.load_json(elo_data_path)
+
+
+def play_and_collect_samples(
+    player1, deck1, player2, deck2, player1_is_trainable, player2_is_trainable
+):
+    """
+    Play one game and return obtained LearnSamples when needed
+    -----
+    Returns
+    samples: list of length 2: samples for player 1, and samples for player 2. If some player is not trainable, their samples will be empty
+    obs: last observation that concludes the game
+    """
+    obs_log = [""]
+    action_log = [None]
+    obs, start_data = battle_start(deck1, deck2)
+    if start_data.errorPlayer >= 0:
+        error = "Deck error."
+        if start_data.errorType == 1:
+            error = "The deck contains invalid card ID."
+        elif start_data.errorType == 2:
+            error = "You can include up to four cards with the same name in the deck, excluding basic Energy cards."
+        elif start_data.errorType == 3:
+            error = "There are no Basic Pokémon in the deck."
+        elif start_data.errorType == 4:
+            error = "You can include only one Ace Spec card in the deck."
+        raise ValueError(error)
+    samples: list[list[transformer.LearnSample]] = [
+        [],
+        [],
+    ]  # [Player0 samples, Player1 samples]
+    while True:
+        if obs["current"]["result"] >= 0:
+            break
+        your_index = obs["current"]["yourIndex"]
+        if your_index == 0:
+            # We play as index 0, generate MCTS actions and training samples
+            selected, sample = player1(obs)
+            if player1_is_trainable:
+                samples[obs["current"]["yourIndex"]].append(sample)
+
+        else:
+            selected, sample = player2(obs)
+            if player2_is_trainable:
+                samples[obs["current"]["yourIndex"]].append(sample)
+
+        obs_log.append(obs)
+        action_log.append(selected)
+        obs = battle_select(selected)
+
+    # For visualiation
+    vis = json.loads(visualize_data())
+    for i in range(len(vis)):
+        vis[i]["obs"] = obs_log[i]
+        vis[i]["action"] = [action_log[i], action_log[i]]
+    with open(vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w") as file:
+        json.dump(vis, file)
+    battle_finish()  # Finalize the game.
+    return samples, action_log, obs_log, obs
+
+
 # A sample deck for training.
-sample_deck = [
+snowy_deck = [
     721,
     721,
     722,
@@ -129,98 +217,67 @@ sample_deck = [
     3,
     3,
 ]
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = transformer.MyModel(128, 2, 256, 1, 1)
-model = model.to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
-loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
-results_dir = Path("results")
-results_dir.mkdir(exist_ok=True)
-weights_dir = results_dir / Path("out")
-weights_dir.mkdir(exist_ok=True)
-vis_savedir = results_dir / Path("visuals")
-vis_savedir.mkdir(exist_ok=True)
-
-
-elo = EloRating(initial=600)
-elo_data_path = results_dir / "elo.json"
-if elo_data_path.exists():
-    print("Restoring elo from", elo_data_path)
-    elo.load_json(elo_data_path)
-
-
-def play_and_collect_samples(
-    player1, deck1, player2, deck2, player1_is_trainable, player2_is_trainable
-):
-    """
-    Play one game and return obtained LearnSamples when needed
-    -----
-    Returns
-    samples: list of length 2: samples for player 1, and samples for player 2. If some player is not trainable, their samples will be empty
-    obs: last observation that concludes the game
-    """
-
-    obs_log = [""]
-    action_log = [None]
-    obs, start_data = battle_start(deck1, deck2)
-    if start_data.errorPlayer >= 0:
-        error = "Deck error."
-        if start_data.errorType == 1:
-            error = "The deck contains invalid card ID."
-        elif start_data.errorType == 2:
-            error = "You can include up to four cards with the same name in the deck, excluding basic Energy cards."
-        elif start_data.errorType == 3:
-            error = "There are no Basic Pokémon in the deck."
-        elif start_data.errorType == 4:
-            error = "You can include only one Ace Spec card in the deck."
-        raise ValueError(error)
-
-    samples: list[list[transformer.LearnSample]] = [
-        [],
-        [],
-    ]  # [Player0 samples, Player1 samples]
-    while True:
-        if obs["current"]["result"] >= 0:
-            break
-        your_index = obs["current"]["yourIndex"]
-        if your_index == 0:
-            # We play as index 0, generate MCTS actions and training samples
-            selected, sample = player1(obs)
-            if player1_is_trainable:
-                samples[obs["current"]["yourIndex"]].append(sample)
-
-        else:
-            selected, sample = player2(obs)
-            if player2_is_trainable:
-                samples[obs["current"]["yourIndex"]].append(sample)
-
-        obs_log.append(obs)
-        action_log.append(selected)
-        obs = battle_select(selected)
-
-    battle_finish()  # Finalize the game.
-    return samples, action_log, obs_log, obs
+player1_deck = mega_lucario_ex_deck
 
 
 def player1(obs):
-    return mcts_agent(obs, sample_deck, model)
+    return mcts_agent(obs, player1_deck, model)
 
 
+player1_name = "model"
 player1_is_trainable = True
+elo.register(player1_name)
+
+
+def select_player2_val():
+
+    player2_name = "rule_based_lucario"
+
+    # Trainables return second item as LearnSample, this does not.
+    def player2(*args, **kwargs):
+        return (rule_based_lucario_agent(*args, **kwargs), None)
+
+    player2_deck = mega_lucario_ex_deck
+    player2_is_trainable = False
+
+    return player2_name, player2, player2_deck, player2_is_trainable
+
+
+def select_player2_train():
+    if random.randint(1, 100) < 0:
+        # Same model, but trains to play another deck
+        model = transformer.MyModel(128, 2, 256, 1, 1)
+        if model_path.exists():
+            model.load_state_dict(
+                torch.load(open(model_path, mode="rb"), weights_only=False)
+            )
+
+        def player2(obs):
+            return mcts_agent(obs, mega_lucario_ex_deck, model)
+
+        player2_deck = mega_lucario_ex_deck
+        player2_is_trainable = True
+        player2_name = player1_name
+
+    else:
+        player2_name = "rule_based_lucario"
+
+        # Trainables return second item as LearnSample, this does not.
+        def player2(*args, **kwargs):
+            return (rule_based_lucario_agent(*args, **kwargs), None)
+
+        player2_deck = mega_lucario_ex_deck
+        player2_is_trainable = False
+
+    return player2_name, player2, player2_deck, player2_is_trainable
+
 
 # The main training loop.
 if __name__ == "__main__":
     wandb.init(project="ptcg-rl", name="transformer-mcts-training")
 
     for counter in range(50):
-        current_model_name = weights_dir / ("model" + str(counter) + ".pth")
-        if current_model_name.exists():
-            print("Restoring ", current_model_name)
-            model.load_state_dict(torch.load(open(current_model_name, mode="rb")))
-        torch.save(model.state_dict(), current_model_name)  # Save the current model.
-        elo.register(str(current_model_name))
+        elo.register(str(player1_name))
         sample_list: list[
             transformer.LearnSample
         ] = []  # List of training data samples.
@@ -231,46 +288,19 @@ if __name__ == "__main__":
             results = [0, 0, 0]
 
             for i in tqdm(range(50), desc=f"Evaluating Epoch {counter}..."):
-                if i % 2 == 0:
-                    player2_path = str(random.choice(list(weights_dir.iterdir())))
-                    player2_model = transformer.MyModel(128, 2, 256, 1, 1)
-                    player2_model.load_state_dict(
-                        torch.load(open(player2_path, mode="rb"), weights_only=False)
-                    )
-                    player2_name = player2_path
-
-                    def player2(obs):
-                        return mcts_agent(obs, sample_deck, model)
-
-                    player2_deck = sample_deck
-                    player2_is_trainable = True
-                else:
-                    player2_name = "rule_based_lucario"
-
-                    # Trainables return second item as LearnSample, this does not.
-                    def player2(*args, **kwargs):
-                        return (rule_based_lucario_agent(*args, **kwargs), None)
-
-                    player2_deck = mega_lucario_ex_deck
-                    player2_is_trainable = False
+                player2_name, player2, player2_deck, player2_is_trainable = (
+                    select_player2_val()
+                )
                 elo.register(player2_name)
 
                 _, action_log, obs_log, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
-                    deck1=sample_deck,
+                    deck1=player1_deck,
                     deck2=player2_deck,
                     player1_is_trainable=player1_is_trainable,
                     player2_is_trainable=player2_is_trainable,
                 )
-
-                # For visualiation
-                vis = json.loads(visualize_data())
-                for i in range(len(vis)):
-                    vis[i]["obs"] = obs_log[i]
-                    vis[i]["action"] = [action_log[i], action_log[i]]
-                with open(vis_savedir / f"vis{i}.json", "w") as file:
-                    json.dump(vis, file)
 
                 if game_result["current"]["result"] == 2:  # Draw
                     elo_our_score = 0.5
@@ -282,7 +312,7 @@ if __name__ == "__main__":
                     elo_our_score = 0
                     results[1] += 1
                 elo.update(
-                    name_a=str(current_model_name),
+                    name_a=str(player1_name),
                     name_b=str(player2_name),
                     a_score=elo_our_score,
                 )
@@ -298,31 +328,14 @@ if __name__ == "__main__":
 
             # Self Play
             for i in tqdm(range(100), desc=f"Data Collecting Epoch {counter}..."):
-                if i % 2 == 0:
-                    player2_path = str(random.choice(list(weights_dir.iterdir())))
-                    player2_model = transformer.MyModel(128, 2, 256, 1, 1)
-                    player2_model.load_state_dict(
-                        torch.load(open(player2_path, mode="rb"), weights_only=False)
-                    )
-                    player2_name = player2_path
-
-                    def player2(obs):
-                        return mcts_agent(obs, sample_deck, model)
-
-                    player2_deck = sample_deck
-                else:
-                    player2_name = "rule_based_lucario"
-
-                    # Trainables return second item as LearnSample, this does not.
-                    def player2(*args, **kwargs):
-                        return (rule_based_lucario_agent(*args, **kwargs), None)
-
-                    player2_deck = mega_lucario_ex_deck
+                player2_name, player2, player2_deck, player2_is_trainable = (
+                    select_player2_train()
+                )
 
                 samples, _, _, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
-                    deck1=sample_deck,
+                    deck1=player1_deck,
                     deck2=player2_deck,
                     player1_is_trainable=player1_is_trainable,
                     player2_is_trainable=player2_is_trainable,
@@ -414,7 +427,7 @@ if __name__ == "__main__":
 
         # Safely extract the ELO score from the EloRating dictionary if accessible
         current_elo = getattr(elo, "rating_dict", getattr(elo, "ratings", {})).get(
-            str(current_model_name), 600
+            str(player1_name), 600
         )
 
         wandb.log(
@@ -427,5 +440,5 @@ if __name__ == "__main__":
                 "loss_total": avg_loss_enc + avg_loss_dec,
             }
         )
-
+        torch.save(model.state_dict(), model_path)
         print("Training Finish.")
