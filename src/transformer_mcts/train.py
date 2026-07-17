@@ -48,9 +48,7 @@ class LearnInput:
             self.offset.append(o + count)
 
 
-def play_and_collect_samples(
-    player1, deck1, player2, deck2, player1_is_trainable, player2_is_trainable
-):
+def play_and_collect_samples(player1, player2):
     """
     Play one game and return obtained LearnSamples when needed
     -----
@@ -60,7 +58,7 @@ def play_and_collect_samples(
     """
     obs_log = [""]
     action_log = [None]
-    obs, start_data = battle_start(deck1, deck2)
+    obs, start_data = battle_start(player1.deck, player2.deck)
     if start_data.errorPlayer >= 0:
         error = "Deck error."
         if start_data.errorType == 1:
@@ -83,12 +81,12 @@ def play_and_collect_samples(
         if your_index == 0:
             # We play as index 0, generate MCTS actions and training samples
             selected, sample = player1(obs)
-            if player1_is_trainable:
+            if player1.is_trainable:
                 samples[obs["current"]["yourIndex"]].append(sample)
 
         else:
             selected, sample = player2(obs)
-            if player2_is_trainable:
+            if player2.is_trainable:
                 samples[obs["current"]["yourIndex"]].append(sample)
 
         obs_log.append(obs)
@@ -279,10 +277,6 @@ if __name__ == "__main__":
                 _, action_log, obs_log, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
-                    deck1=player1.deck,
-                    deck2=player2.deck,
-                    player1_is_trainable=player1.is_trainable,
-                    player2_is_trainable=player2.is_trainable,
                 )
 
                 if game_result["current"]["result"] == 2:  # Draw
@@ -315,10 +309,6 @@ if __name__ == "__main__":
                 samples, _, _, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
-                    deck1=player1.deck,
-                    deck2=player2.deck,
-                    player1_is_trainable=player1.is_trainable,
-                    player2_is_trainable=player2.is_trainable,
                 )
                 # Calculate the training labels and add them to the training data list.
                 for i in range(2):
