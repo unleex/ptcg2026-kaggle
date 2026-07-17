@@ -27,36 +27,6 @@ from rule_based_mega_lucario_ex.agent import (
     my_deck as mega_lucario_ex_deck,
 )
 
-results_dir = Path("results_exploration")
-results_dir.mkdir(exist_ok=True)
-weights_dir = results_dir / Path("out")
-weights_dir.mkdir(exist_ok=True)
-vis_savedir = results_dir / Path("visuals")
-vis_savedir.mkdir(exist_ok=True)
-
-# Load all card data from the API's helper function
-all_card = all_card_data()
-# Create a lookup table (dictionary) to quickly access card data by its cardId
-card_table = {c.cardId: c for c in all_card}
-card_count = max(all_card, key=lambda c: c.cardId).cardId + 1  # Max Card ID + 1
-
-attack_count = (
-    max(all_attack(), key=lambda a: a.attackId).attackId + 1
-)  # Max Attack ID + 1
-
-num_words_encoder = 24
-encoder_size = 22000  # Encoder input size exceeding the vocabulary size
-
-decoder_main_feature = 8  # Feature count of SelectContext.Main
-decoder_attack_offset = 14  # First index of Attack feature
-decoder_card_offset = (
-    decoder_attack_offset + attack_count
-)  # First index of Card Feature
-decoder_size = (
-    decoder_card_offset
-    + (1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION) * card_count
-)  # Decoder input vocabulary size
-
 
 # Helper class to construct batch inputs for the neural network.
 class LearnInput:
@@ -75,25 +45,6 @@ class LearnInput:
         self.value.extend(sv.value)
         for o in sv.offset:
             self.offset.append(o + count)
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = transformer.MyModel(128, 2, 256, 1, 1)
-model = model.to(device)
-model_path = weights_dir / "model.pth"
-if model_path.exists():
-    print("❇️Restoring", model_path)
-    model.load_state_dict(torch.load(model_path, weights_only=False))
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
-loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
-
-elo = EloRating(initial=600)
-elo_data_path = results_dir / "elo.json"
-if elo_data_path.exists():
-    print("❇️Restoring elo from", elo_data_path)
-    elo.load_json(elo_data_path)
 
 
 def play_and_collect_samples(
@@ -217,6 +168,58 @@ snowy_deck = [
     3,
     3,
 ]
+
+results_dir = Path("results_exploration")
+results_dir.mkdir(exist_ok=True)
+weights_dir = results_dir / Path("out")
+weights_dir.mkdir(exist_ok=True)
+vis_savedir = results_dir / Path("visuals")
+vis_savedir.mkdir(exist_ok=True)
+
+# Load all card data from the API's helper function
+all_card = all_card_data()
+# Create a lookup table (dictionary) to quickly access card data by its cardId
+card_table = {c.cardId: c for c in all_card}
+card_count = max(all_card, key=lambda c: c.cardId).cardId + 1  # Max Card ID + 1
+
+attack_count = (
+    max(all_attack(), key=lambda a: a.attackId).attackId + 1
+)  # Max Attack ID + 1
+
+num_words_encoder = 24
+encoder_size = 22000  # Encoder input size exceeding the vocabulary size
+
+decoder_main_feature = 8  # Feature count of SelectContext.Main
+decoder_attack_offset = 14  # First index of Attack feature
+decoder_card_offset = (
+    decoder_attack_offset + attack_count
+)  # First index of Card Feature
+decoder_size = (
+    decoder_card_offset
+    + (1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION) * card_count
+)  # Decoder input vocabulary size
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = transformer.MyModel(128, 2, 256, 1, 1)
+model = model.to(device)
+model_path = weights_dir / "model.pth"
+if model_path.exists():
+    print("❇️Restoring", model_path)
+    model.load_state_dict(torch.load(model_path, weights_only=False))
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
+loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
+
+elo = EloRating(initial=600)
+elo_data_path = results_dir / "elo.json"
+if elo_data_path.exists():
+    print("❇️Restoring elo from", elo_data_path)
+    elo.load_json(elo_data_path)
+
+# ----- Players definition -----
+
 player1_deck = mega_lucario_ex_deck
 
 
@@ -226,7 +229,6 @@ def player1(obs):
 
 player1_name = "model"
 player1_is_trainable = True
-elo.register(player1_name)
 
 
 def select_player2_val():
@@ -291,6 +293,7 @@ if __name__ == "__main__":
                 player2_name, player2, player2_deck, player2_is_trainable = (
                     select_player2_val()
                 )
+                elo.register(player1_name)
                 elo.register(player2_name)
 
                 _, action_log, obs_log, game_result = play_and_collect_samples(
@@ -454,14 +457,11 @@ if __name__ == "__main__":
                 explained_variance = torch.tensor(float("nan"))
             running_expl_var += explained_variance.item()
             running_kl_div += kl_div.item()
-
         avg_loss_enc = epoch_loss_enc / batch_count
         avg_loss_dec = epoch_loss_dec / batch_count
 
-        # Safely extract the ELO score from the EloRating dictionary if accessible
-        current_elo = getattr(elo, "rating_dict", getattr(elo, "ratings", {})).get(
-            str(player1_name), 600
-        )
+        # Retrieve elo of player 1
+        current_elo = elo.ratings[player1_name]
 
         wandb.log(
             {
