@@ -1,3 +1,4 @@
+import multiprocessing as mp
 from player import Player
 import json
 import random
@@ -27,6 +28,7 @@ from rule_based_mega_lucario_ex.agent import (
     agent as rule_based_lucario_agent,
     my_deck as mega_lucario_ex_deck,
 )
+from concurrent.futures import ProcessPoolExecutor, Future
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -98,10 +100,8 @@ def play_and_collect_samples(player1, player2):
     for i in range(len(vis)):
         vis[i]["obs"] = obs_log[i]
         vis[i]["action"] = [action_log[i], action_log[i]]
-    with open(vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w") as file:
-        json.dump(vis, file)
     battle_finish()  # Finalize the game.
-    return samples, action_log, obs_log, obs
+    return samples, action_log, obs_log, obs, vis
 
 
 # A sample deck for training.
@@ -203,9 +203,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = transformer.MyModel(128, 2, 256, 1, 1)
 model = model.to(device)
 model_path = weights_dir / "model.pth"
-if model_path.exists():
-    print("❇️Restoring", model_path)
-    model.load_state_dict(torch.load(model_path, weights_only=False))
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
@@ -213,9 +210,6 @@ loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss fu
 
 elo = EloRating(initial=600)
 elo_data_path = results_dir / "elo.json"
-if elo_data_path.exists():
-    print("❇️Restoring elo from", elo_data_path)
-    elo.load_json(elo_data_path)
 
 # ----- Players definition -----
 
@@ -257,6 +251,15 @@ def select_player2_train():
 
 # The main training loop.
 if __name__ == "__main__":
+    if model_path.exists():
+        print("❇️Restoring", model_path)
+        model.load_state_dict(torch.load(model_path, weights_only=False))
+
+    if elo_data_path.exists():
+        print("❇️Restoring elo from", elo_data_path)
+        elo.load_json(elo_data_path)
+
+    ctx = mp.get_context("spawn")  # Won't work without it, i suppose
     wandb.init(project="ptcg-rl", name="transformer-mcts-training")
 
     for counter in range(500):
@@ -268,32 +271,37 @@ if __name__ == "__main__":
         with torch.inference_mode():
             # Evaluation
             results = [0, 0, 0]
-
-            for i in tqdm(range(50), desc=f"Evaluating Epoch {counter}..."):
-                player2 = select_player2_val()
-                elo.register(player1.name)
-                elo.register(player2.name)
-
-                _, action_log, obs_log, game_result = play_and_collect_samples(
-                    player1=player1,
-                    player2=player2,
-                )
-
-                if game_result["current"]["result"] == 2:  # Draw
-                    elo_our_score = 0.5
-                    results[2] += 1
-                elif game_result["current"]["result"] == 0:  # Win
-                    elo_our_score = 1
-                    results[0] += 1
-                else:  # Loss
-                    elo_our_score = 0
-                    results[1] += 1
-                elo.update(
-                    name_a=str(player1.name),
-                    name_b=str(player2.name),
-                    a_score=elo_our_score,
-                )
-
+            futures: list[Future] = []
+            # Move to cpu to avoid gpu-cpu transfer bottlenecks between processes
+            model.to("cpu")
+            with ProcessPoolExecutor(max_workers=10, mp_context=ctx) as executor:
+                for _ in range(50):
+                    player2 = select_player2_val()
+                    elo.register(player1.name)
+                    elo.register(player2.name)
+                    futures.append(
+                        executor.submit(play_and_collect_samples, player1, player2)
+                    )
+                for future in tqdm(futures, desc=f"Evaluating Epoch {counter}..."):
+                    _, action_log, obs_log, game_result, vis = future.result()
+                    with open(
+                        vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w"
+                    ) as file:
+                        json.dump(vis, file)
+                    if game_result["current"]["result"] == 2:  # Draw
+                        elo_our_score = 0.5
+                        results[2] += 1
+                    elif game_result["current"]["result"] == 0:  # Win
+                        elo_our_score = 1
+                        results[0] += 1
+                    else:  # Loss
+                        elo_our_score = 0
+                        results[1] += 1
+                    elo.update(
+                        name_a=str(player1.name),
+                        name_b=str(player2.name),
+                        a_score=elo_our_score,
+                    )
             win_rate = (
                 100 * results[0] // (results[0] + results[1])
                 if (results[0] + results[1]) > 0
@@ -302,29 +310,36 @@ if __name__ == "__main__":
             print(f"Evaluation win rate {win_rate}%", flush=True)
             print(elo.summary())
             elo.save_json(elo_data_path)
+            futures = []
+            with ProcessPoolExecutor(max_workers=10, mp_context=ctx) as executor:
+                for _ in range(100):
+                    player2 = select_player2_val()
+                    elo.register(player1.name)
+                    elo.register(player2.name)
+                    futures.append(
+                        executor.submit(play_and_collect_samples, player1, player2)
+                    )
+                for future in tqdm(futures, desc=f"Data Collecting Epoch {counter}..."):
+                    samples, _, _, game_result, vis = future.result()
+                    with open(
+                        vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w"
+                    ) as file:
+                        json.dump(vis, file)
+                    # Calculate the training labels and add them to the training data list.
+                    for i in range(2):
+                        LAMBDA = 0.9
+                        # The final value is 1.0 for a win and -1.0 for a loss.
+                        value = 1.0 if i == game_result["current"]["result"] else -1.0
 
-            for i in tqdm(range(100), desc=f"Data Collecting Epoch {counter}..."):
-                player2 = select_player2_train()
-
-                samples, _, _, game_result = play_and_collect_samples(
-                    player1=player1,
-                    player2=player2,
-                )
-                # Calculate the training labels and add them to the training data list.
-                for i in range(2):
-                    LAMBDA = 0.9
-                    # The final value is 1.0 for a win and -1.0 for a loss.
-                    value = 1.0 if i == game_result["current"]["result"] else -1.0
-
-                    # Iterate backwards from the end of the game to calculate values.
-                    for sample in reversed(samples[i]):
-                        label = (value + sample.value) * 0.5
-                        value = value * LAMBDA + sample.value * (1.0 - LAMBDA)
-                        sample.value = label
-                        sample_list.append(sample)
-
+                        # Iterate backwards from the end of the game to calculate values.
+                        for sample in reversed(samples[i]):
+                            label = (value + sample.value) * 0.5
+                            value = value * LAMBDA + sample.value * (1.0 - LAMBDA)
+                            sample.value = label
+                            sample_list.append(sample)
+        # Move back from cpu
+        model.to(device)
         # Train on the training data collected through self-play.
-        print("Training Start.")
         model.train()
         random.shuffle(sample_list)
         BATCH_SIZE = 128
@@ -443,4 +458,3 @@ if __name__ == "__main__":
             }
         )
         torch.save(model.state_dict(), model_path)
-        print("Training Finish.")
