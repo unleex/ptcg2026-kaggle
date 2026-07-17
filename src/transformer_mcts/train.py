@@ -168,7 +168,7 @@ snowy_deck = [
     3,
 ]
 
-results_dir = Path("results_exploration")
+results_dir = Path("results_discrete_label")
 results_dir.mkdir(exist_ok=True)
 weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
@@ -329,13 +329,14 @@ if __name__ == "__main__":
                     for i in range(2):
                         LAMBDA = 0.9
                         # The final value is 1.0 for a win and -1.0 for a loss.
-                        value = 1.0 if i == game_result["current"]["result"] else -1.0
-
-                        # Iterate backwards from the end of the game to calculate values.
-                        for sample in reversed(samples[i]):
-                            label = (value + sample.value) * 0.5
-                            value = value * LAMBDA + sample.value * (1.0 - LAMBDA)
-                            sample.value = label
+                        if game_result["current"]["result"] == 2:
+                            final_outcome = 0.0
+                        else:
+                            final_outcome = (
+                                1.0 if i == game_result["current"]["result"] else -1.0
+                            )
+                        for sample in samples[i]:
+                            sample.value = final_outcome
                             sample_list.append(sample)
         # Move back from cpu
         model.to(device)
@@ -428,6 +429,8 @@ if __name__ == "__main__":
 
             # Backpropagate the loss and update model parameters.
             loss.backward()
+            # Prevent explosions
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             target_var = torch.var(label_tensor_enc)
             if target_var > 0:
@@ -446,7 +449,6 @@ if __name__ == "__main__":
 
         wandb.log(
             {
-                "epoch": counter,
                 "eval_win_rate": win_rate,
                 "elo": current_elo,
                 "loss_encoder": avg_loss_enc,
