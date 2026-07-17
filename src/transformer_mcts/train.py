@@ -1,3 +1,4 @@
+from player import Player
 import json
 import random
 import wandb
@@ -223,55 +224,37 @@ if elo_data_path.exists():
 player1_deck = mega_lucario_ex_deck
 
 
-def player1(obs):
+def player1_model(obs):
     return mcts_agent(obs, player1_deck, model)
 
 
-player1_name = "model"
-player1_is_trainable = True
+player1 = Player(
+    model=player1_model, name="model", deck=player1_deck, is_trainable=True
+)
+
+
+def player_lucario_agent(*args, **kwargs):
+    return (rule_based_lucario_agent(*args, **kwargs), None)
+
+
+player_lucario = Player(
+    model=player_lucario_agent,
+    name="rule_based_lucario",
+    deck=mega_lucario_ex_deck,
+    is_trainable=False,
+)
 
 
 def select_player2_val():
-
-    player2_name = "rule_based_lucario"
-
-    # Trainables return second item as LearnSample, this does not.
-    def player2(*args, **kwargs):
-        return (rule_based_lucario_agent(*args, **kwargs), None)
-
-    player2_deck = mega_lucario_ex_deck
-    player2_is_trainable = False
-
-    return player2_name, player2, player2_deck, player2_is_trainable
+    return player_lucario
 
 
 def select_player2_train():
     if random.randint(1, 100) < 50:
-        # Same model, but trains to play another deck
-        model = transformer.MyModel(128, 2, 256, 1, 1)
-        if model_path.exists():
-            model.load_state_dict(
-                torch.load(open(model_path, mode="rb"), weights_only=False)
-            )
-
-        def player2(obs):
-            return mcts_agent(obs, mega_lucario_ex_deck, model)
-
-        player2_deck = mega_lucario_ex_deck
-        player2_is_trainable = True
-        player2_name = player1_name
+        return player1
 
     else:
-        player2_name = "rule_based_lucario"
-
-        # Trainables return second item as LearnSample, this does not.
-        def player2(*args, **kwargs):
-            return (rule_based_lucario_agent(*args, **kwargs), None)
-
-        player2_deck = mega_lucario_ex_deck
-        player2_is_trainable = False
-
-    return player2_name, player2, player2_deck, player2_is_trainable
+        return player_lucario
 
 
 # The main training loop.
@@ -279,7 +262,6 @@ if __name__ == "__main__":
     wandb.init(project="ptcg-rl", name="transformer-mcts-training")
 
     for counter in range(500):
-        elo.register(str(player1_name))
         sample_list: list[
             transformer.LearnSample
         ] = []  # List of training data samples.
@@ -290,19 +272,17 @@ if __name__ == "__main__":
             results = [0, 0, 0]
 
             for i in tqdm(range(50), desc=f"Evaluating Epoch {counter}..."):
-                player2_name, player2, player2_deck, player2_is_trainable = (
-                    select_player2_val()
-                )
-                elo.register(player1_name)
-                elo.register(player2_name)
+                player2 = select_player2_val()
+                elo.register(player1.name)
+                elo.register(player2.name)
 
                 _, action_log, obs_log, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
-                    deck1=player1_deck,
-                    deck2=player2_deck,
-                    player1_is_trainable=player1_is_trainable,
-                    player2_is_trainable=player2_is_trainable,
+                    deck1=player1.deck,
+                    deck2=player2.deck,
+                    player1_is_trainable=player1.is_trainable,
+                    player2_is_trainable=player2.is_trainable,
                 )
 
                 if game_result["current"]["result"] == 2:  # Draw
@@ -311,12 +291,12 @@ if __name__ == "__main__":
                 elif game_result["current"]["result"] == 0:  # Win
                     elo_our_score = 1
                     results[0] += 1
-                else:  # Lose
+                else:  # Loss
                     elo_our_score = 0
                     results[1] += 1
                 elo.update(
-                    name_a=str(player1_name),
-                    name_b=str(player2_name),
+                    name_a=str(player1.name),
+                    name_b=str(player2.name),
                     a_score=elo_our_score,
                 )
 
@@ -330,17 +310,15 @@ if __name__ == "__main__":
             elo.save_json(elo_data_path)
 
             for i in tqdm(range(100), desc=f"Data Collecting Epoch {counter}..."):
-                player2_name, player2, player2_deck, player2_is_trainable = (
-                    select_player2_train()
-                )
+                player2 = select_player2_train()
 
                 samples, _, _, game_result = play_and_collect_samples(
                     player1=player1,
                     player2=player2,
-                    deck1=player1_deck,
-                    deck2=player2_deck,
-                    player1_is_trainable=player1_is_trainable,
-                    player2_is_trainable=player2_is_trainable,
+                    deck1=player1.deck,
+                    deck2=player2.deck,
+                    player1_is_trainable=player1.is_trainable,
+                    player2_is_trainable=player2.is_trainable,
                 )
                 # Calculate the training labels and add them to the training data list.
                 for i in range(2):
@@ -421,7 +399,6 @@ if __name__ == "__main__":
             )
             loss_dec = loss_dec.mean()
             # Calculate entropy of the network's output distribution
-            # Compute log probabilities of your masked network outputs
             log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
 
             # KL Divergence between MCTS target distribution and Network distribution
@@ -436,7 +413,7 @@ if __name__ == "__main__":
                 .mean()
             )
 
-            # Add to total loss (ENTROPY_COEF is usually between 0.01 and 0.05)
+            # Add to total loss
             ENTROPY_COEF = 0.02
             loss = loss_enc + loss_dec - ENTROPY_COEF * entropy
 
@@ -447,7 +424,6 @@ if __name__ == "__main__":
             # Backpropagate the loss and update model parameters.
             loss.backward()
             optimizer.step()
-            # Assuming out_enc is the predicted value and label_tensor_enc is the target
             target_var = torch.var(label_tensor_enc)
             if target_var > 0:
                 explained_variance = (
@@ -461,7 +437,7 @@ if __name__ == "__main__":
         avg_loss_dec = epoch_loss_dec / batch_count
 
         # Retrieve elo of player 1
-        current_elo = elo.ratings[player1_name]
+        current_elo = elo.ratings[player1.name]
 
         wandb.log(
             {
