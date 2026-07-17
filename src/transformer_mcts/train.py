@@ -1,4 +1,5 @@
-import multiprocessing as mp
+import time
+import torch.multiprocessing as mp
 from player import Player
 import json
 import random
@@ -168,7 +169,7 @@ snowy_deck = [
     3,
 ]
 
-results_dir = Path("results_discrete_label")
+results_dir = Path("results_optimistic")
 results_dir.mkdir(exist_ok=True)
 weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
@@ -244,7 +245,6 @@ def select_player2_val():
 def select_player2_train():
     if random.randint(1, 100) < 50:
         return player1
-
     else:
         return player_lucario
 
@@ -259,7 +259,9 @@ if __name__ == "__main__":
         print("❇️Restoring elo from", elo_data_path)
         elo.load_json(elo_data_path)
 
-    ctx = mp.get_context("spawn")  # Won't work without it, i suppose
+    ctx = mp.get_context("spawn")
+    model.share_memory()  # Prepares model tensors for cross-process memory mapping
+    pool = ctx.Pool(processes=20)  # Persistent torch.mp worker pool
     wandb.init(project="ptcg-rl", name="transformer-mcts-training")
 
     for counter in range(500):
@@ -271,37 +273,50 @@ if __name__ == "__main__":
         with torch.inference_mode():
             # Evaluation
             results = [0, 0, 0]
-            futures: list[Future] = []
-            # Move to cpu to avoid gpu-cpu transfer bottlenecks between processes
-            model.to("cpu")
-            with ProcessPoolExecutor(max_workers=10, mp_context=ctx) as executor:
-                for _ in range(50):
-                    player2 = select_player2_val()
-                    elo.register(player1.name)
-                    elo.register(player2.name)
-                    futures.append(
-                        executor.submit(play_and_collect_samples, player1, player2)
-                    )
-                for future in tqdm(futures, desc=f"Evaluating Epoch {counter}..."):
-                    _, action_log, obs_log, game_result, vis = future.result()
-                    with open(
-                        vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w"
-                    ) as file:
-                        json.dump(vis, file)
-                    if game_result["current"]["result"] == 2:  # Draw
-                        elo_our_score = 0.5
-                        results[2] += 1
-                    elif game_result["current"]["result"] == 0:  # Win
-                        elo_our_score = 1
-                        results[0] += 1
-                    else:  # Loss
-                        elo_our_score = 0
-                        results[1] += 1
-                    elo.update(
-                        name_a=str(player1.name),
-                        name_b=str(player2.name),
-                        a_score=elo_our_score,
-                    )
+            model.to(device)
+
+            start_time = time.perf_counter()
+            total_samples = 0
+
+            async_eval_results = []
+            for _ in range(50):
+                player2 = select_player2_val()
+                elo.register(player1.name)
+                elo.register(player2.name)
+                async_eval_results.append(
+                    pool.apply_async(play_and_collect_samples, args=(player1, player2))
+                )
+
+            pbar = tqdm(async_eval_results, desc=f"Evaluating Epoch {counter}...")
+            for async_res in pbar:
+                samples, action_log, obs_log, game_result, vis = async_res.get()
+
+                file_idx = len(list(vis_savedir.iterdir()))
+                with open(vis_savedir / f"vis{file_idx}.json", "w") as file:
+                    json.dump(vis, file)
+
+                if game_result["current"]["result"] == 2:  # Draw
+                    elo_our_score = 0.5
+                    results[2] += 1
+                elif game_result["current"]["result"] == 0:  # Win
+                    elo_our_score = 1
+                    results[0] += 1
+                else:  # Loss
+                    elo_our_score = 0
+                    results[1] += 1
+                elo.update(
+                    name_a=str(player1.name),
+                    name_b=str(player2.name),
+                    a_score=elo_our_score,
+                )
+
+                # Track real-time throughput
+                game_samples = sum(len(player_samples) for player_samples in samples)
+                total_samples += game_samples
+                elapsed = time.perf_counter() - start_time
+                sps = total_samples / elapsed if elapsed > 0 else 0
+                pbar.set_postfix(SPS=f"{sps:.1f}", Samples=total_samples)
+
             win_rate = (
                 100 * results[0] // (results[0] + results[1])
                 if (results[0] + results[1]) > 0
@@ -310,34 +325,37 @@ if __name__ == "__main__":
             print(f"Evaluation win rate {win_rate}%", flush=True)
             print(elo.summary())
             elo.save_json(elo_data_path)
-            futures = []
-            with ProcessPoolExecutor(max_workers=10, mp_context=ctx) as executor:
-                for _ in range(100):
-                    player2 = select_player2_val()
-                    elo.register(player1.name)
-                    elo.register(player2.name)
-                    futures.append(
-                        executor.submit(play_and_collect_samples, player1, player2)
-                    )
-                for future in tqdm(futures, desc=f"Data Collecting Epoch {counter}..."):
-                    samples, _, _, game_result, vis = future.result()
-                    with open(
-                        vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w"
-                    ) as file:
-                        json.dump(vis, file)
-                    # Calculate the training labels and add them to the training data list.
-                    for i in range(2):
-                        LAMBDA = 0.9
-                        # The final value is 1.0 for a win and -1.0 for a loss.
-                        if game_result["current"]["result"] == 2:
-                            final_outcome = 0.0
-                        else:
-                            final_outcome = (
-                                1.0 if i == game_result["current"]["result"] else -1.0
-                            )
-                        for sample in samples[i]:
-                            sample.value = final_outcome
-                            sample_list.append(sample)
+
+            async_train_results = []
+            for _ in range(100):
+                player2 = select_player2_train()
+                elo.register(player1.name)
+                elo.register(player2.name)
+                async_train_results.append(
+                    pool.apply_async(play_and_collect_samples, args=(player1, player2))
+                )
+
+            for async_res in tqdm(
+                async_train_results, desc=f"Data Collecting Epoch {counter}..."
+            ):
+                samples, _, _, game_result, vis = async_res.get()
+                with open(
+                    vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w"
+                ) as file:
+                    json.dump(vis, file)
+                # Calculate the training labels and add them to the training data list.
+                for i in range(2):
+                    LAMBDA = 0.9
+                    # The final value is 1.0 for a win and -1.0 for a loss.
+                    if game_result["current"]["result"] == 2:
+                        final_outcome = 0.0
+                    else:
+                        final_outcome = (
+                            1.0 if i == game_result["current"]["result"] else -1.0
+                        )
+                    for sample in samples[i]:
+                        sample.value = final_outcome
+                        sample_list.append(sample)
         # Move back from cpu
         model.to(device)
         # Train on the training data collected through self-play.
