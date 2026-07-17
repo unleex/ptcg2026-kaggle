@@ -108,7 +108,6 @@ class MyModel(torch.nn.Module):
             p = layer(p, encoder_out)
         p = self.decoder_fc(p)
         p = p.transpose(0, 1).view(batch_size, -1)
-        p = torch.tanh(p)
         return (v, p)
 
 

@@ -1,3 +1,4 @@
+import torch
 import math
 
 from cg.api import (
@@ -13,7 +14,7 @@ from cg.api import (
     to_observation_class,
 )
 
-SEARCH_COUNT = 10  # MCTS Search count
+SEARCH_COUNT = 50  # MCTS Search count
 
 
 # MCTS Node Child
@@ -89,7 +90,15 @@ def create_node(
             else:
                 break
 
-        sv_enc = transformer.get_encoder_input(obs, your_deck)
+        # Determine which deck to pass based on who is active in this simulation step
+        if obs.current.yourIndex == your_index:
+            current_deck = your_deck
+        else:
+            # Use the simulated Snorlax deck we initialized in search_begin.
+            opponent_active_index = obs.current.yourIndex
+            current_deck = [1072] * obs.current.players[opponent_active_index].deckCount
+
+        sv_enc = transformer.get_encoder_input(obs, current_deck)
         sv_dec = transformer.get_decoder_input(obs, actions)
         value, policy = transformer.eval_nn(sv_enc, sv_dec, model)
         v = value
@@ -141,7 +150,22 @@ def mcts_agent(
     root, sample = create_node(
         None, search_state, your_index, your_deck, model
     )  # Create root node.
+    DIRICHLET_ALPHA = 0.3  # Typical for games with many actions
 
+    EXPLORATION_FRACTION = 0.25
+
+    noise = (
+        torch.distributions.dirichlet.Dirichlet(
+            torch.full((len(root.children),), DIRICHLET_ALPHA)
+        )
+        .sample()
+        .tolist()
+    )
+
+    for i, child in enumerate(root.children):
+        child.prob = (
+            child.prob * (1 - EXPLORATION_FRACTION) + noise[i] * EXPLORATION_FRACTION
+        )
     # Search
     for _ in range(SEARCH_COUNT):
         current = root
@@ -189,14 +213,16 @@ def mcts_agent(
 
     # Generate training data
     sample.value = root.total / root.visit
-    for i in range(len(root.children)):
-        child = root.children[i]
-        v = sample.value
-        if child.node is None:
-            v = min_value - v - 0.03
-        else:
-            v = child.node.total / child.node.visit - v
-        sample.policy[i] = max(-1.0, min(1.0, v))
+    visits = [
+        child.node.visit if child.node is not None else 0 for child in root.children
+    ]
+    sum_visits = sum(visits)
+    if sum_visits > 0:
+        for i in range(len(root.children)):
+            sample.policy[i] = visits[i] / sum_visits
+    else:
+        for i in range(len(root.children)):
+            sample.policy[i] = 1.0 / len(root.children)
 
     search_end()
     return (max_child.select, sample)

@@ -27,7 +27,7 @@ from rule_based_mega_lucario_ex.agent import (
     my_deck as mega_lucario_ex_deck,
 )
 
-results_dir = Path("results_working")
+results_dir = Path("results_exploration")
 results_dir.mkdir(exist_ok=True)
 weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
@@ -82,7 +82,7 @@ model = transformer.MyModel(128, 2, 256, 1, 1)
 model = model.to(device)
 model_path = weights_dir / "model.pth"
 if model_path.exists():
-    print("Restoring", model_path)
+    print("❇️Restoring", model_path)
     model.load_state_dict(torch.load(model_path, weights_only=False))
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -92,7 +92,7 @@ loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss fu
 elo = EloRating(initial=600)
 elo_data_path = results_dir / "elo.json"
 if elo_data_path.exists():
-    print("Restoring elo from", elo_data_path)
+    print("❇️Restoring elo from", elo_data_path)
     elo.load_json(elo_data_path)
 
 
@@ -244,7 +244,7 @@ def select_player2_val():
 
 
 def select_player2_train():
-    if random.randint(1, 100) < 0:
+    if random.randint(1, 100) < 50:
         # Same model, but trains to play another deck
         model = transformer.MyModel(128, 2, 256, 1, 1)
         if model_path.exists():
@@ -276,7 +276,7 @@ def select_player2_train():
 if __name__ == "__main__":
     wandb.init(project="ptcg-rl", name="transformer-mcts-training")
 
-    for counter in range(50):
+    for counter in range(500):
         elo.register(str(player1_name))
         sample_list: list[
             transformer.LearnSample
@@ -326,7 +326,6 @@ if __name__ == "__main__":
             print(elo.summary())
             elo.save_json(elo_data_path)
 
-            # Self Play
             for i in tqdm(range(100), desc=f"Data Collecting Epoch {counter}..."):
                 player2_name, player2, player2_deck, player2_is_trainable = (
                     select_player2_train()
@@ -362,6 +361,9 @@ if __name__ == "__main__":
 
         epoch_loss_enc = 0.0
         epoch_loss_dec = 0.0
+        entropy_epoch = 0.0
+        running_expl_var = 0.0
+        running_kl_div = 0.0
 
         for i in tqdm(range(batch_count), desc=f"Training Epoch {counter}..."):
             # Prepare a batch of data.
@@ -410,20 +412,51 @@ if __name__ == "__main__":
 
             # Calculate loss.
             loss_enc = loss_fn_enc(out_enc, label_tensor_enc)
-            loss_dec = loss_fn_dec(out_dec, label_tensor_dec)
-            loss_dec = loss_dec * mask_tensor
-            loss_dec = loss_dec.sum() / float(BATCH_SIZE)
-            loss = loss_enc + loss_dec
+            masked_logits = out_dec.masked_fill(mask_tensor == 0.0, -1e9)
+            loss_dec = torch.nn.functional.cross_entropy(
+                masked_logits, label_tensor_dec, reduction="none"
+            )
+            loss_dec = loss_dec.mean()
+            # Calculate entropy of the network's output distribution
+            # Compute log probabilities of your masked network outputs
+            log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
+
+            # KL Divergence between MCTS target distribution and Network distribution
+            kl_div = torch.nn.functional.kl_div(
+                log_probs, label_tensor_dec, reduction="batchmean"
+            )
+            probs = torch.exp(log_probs)
+            entropy = (
+                -(probs * log_probs)
+                .masked_fill(mask_tensor == 0.0, 0.0)
+                .sum(dim=-1)
+                .mean()
+            )
+
+            # Add to total loss (ENTROPY_COEF is usually between 0.01 and 0.05)
+            ENTROPY_COEF = 0.02
+            loss = loss_enc + loss_dec - ENTROPY_COEF * entropy
 
             epoch_loss_enc += loss_enc.item()
             epoch_loss_dec += loss_dec.item()
+            entropy_epoch += entropy.item()
 
             # Backpropagate the loss and update model parameters.
             loss.backward()
             optimizer.step()
+            # Assuming out_enc is the predicted value and label_tensor_enc is the target
+            target_var = torch.var(label_tensor_enc)
+            if target_var > 0:
+                explained_variance = (
+                    1 - torch.var(label_tensor_enc - out_enc) / target_var
+                )
+            else:
+                explained_variance = torch.tensor(float("nan"))
+            running_expl_var += explained_variance.item()
+            running_kl_div += kl_div.item()
 
-        avg_loss_enc = epoch_loss_enc / batch_count if batch_count > 0 else 0
-        avg_loss_dec = epoch_loss_dec / batch_count if batch_count > 0 else 0
+        avg_loss_enc = epoch_loss_enc / batch_count
+        avg_loss_dec = epoch_loss_dec / batch_count
 
         # Safely extract the ELO score from the EloRating dictionary if accessible
         current_elo = getattr(elo, "rating_dict", getattr(elo, "ratings", {})).get(
@@ -437,7 +470,10 @@ if __name__ == "__main__":
                 "elo": current_elo,
                 "loss_encoder": avg_loss_enc,
                 "loss_decoder": avg_loss_dec,
+                "entropy": entropy_epoch / batch_count,
                 "loss_total": avg_loss_enc + avg_loss_dec,
+                "kl_div": running_kl_div / batch_count,
+                "expl_var": running_expl_var / batch_count,
             }
         )
         torch.save(model.state_dict(), model_path)

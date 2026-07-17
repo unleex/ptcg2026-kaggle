@@ -35,8 +35,8 @@ class EloRating:
         Updates ratings using an aggregated win rate (0.0 to 1.0) instead of individual rows.
         a_score: 1.0 if player A won, 0.5 if draw, 0.0 if player B won.
         """
+        assert name_a != name_b
         k = custom_k if custom_k is not None else self.k
-
         # 1. Calculate expected win probabilities based on current frozen ratings
         e_a = self.expected(name_a, name_b)
         e_b = 1.0 - e_a
