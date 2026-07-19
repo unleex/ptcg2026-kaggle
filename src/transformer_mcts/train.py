@@ -25,11 +25,10 @@ from kaggle_ptcg_engine.ptcg.cg.game import (
 import transformer_mcts.transformer as transformer
 from transformer_mcts.mcts import mcts_agent
 from elo import EloRating
-from rule_based_mega_lucario_ex.agent import (
+from agents.rule_based_lucario import (
     agent as rule_based_lucario_agent,
     my_deck as mega_lucario_ex_deck,
 )
-from concurrent.futures import ProcessPoolExecutor, Future
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -169,7 +168,7 @@ snowy_deck = [
     3,
 ]
 
-results_dir = Path("results_optimistic")
+results_dir = Path("results_fixed_lambda")
 results_dir.mkdir(exist_ok=True)
 weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
@@ -199,13 +198,13 @@ decoder_size = (
     + (1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION) * card_count
 )  # Decoder input vocabulary size
 
-
+SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = transformer.MyModel(128, 2, 256, 1, 1)
-model = model.to(device)
+model = transformer.MyModel(128, 2, 256, 1, 1).to(device)
+model2 = transformer.MyModel(128, 2, 256, 1, 1).to(device)
 model_path = weights_dir / "model.pth"
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+model2_path = weights_dir / "model2.pth"
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
 loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
 
@@ -221,8 +220,15 @@ def player1_model(obs):
     return mcts_agent(obs, player1_deck, model)
 
 
+def player2_model(obs):
+    return mcts_agent(obs, player1_deck, model2)
+
+
 player1 = Player(
     model=player1_model, name="model", deck=player1_deck, is_trainable=True
+)
+player2 = Player(
+    model=player2_model, name="model2", deck=player1_deck, is_trainable=False
 )
 
 
@@ -243,10 +249,7 @@ def select_player2_val():
 
 
 def select_player2_train():
-    if random.randint(1, 100) < 50:
-        return player1
-    else:
-        return player_lucario
+    return player1
 
 
 # The main training loop.
@@ -254,6 +257,9 @@ if __name__ == "__main__":
     if model_path.exists():
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(model_path, weights_only=False))
+    if model2_path.exists():
+        print("❇️Restoring", model2_path)
+        model2.load_state_dict(torch.load(model2_path, weights_only=False))
 
     if elo_data_path.exists():
         print("❇️Restoring elo from", elo_data_path)
@@ -261,7 +267,7 @@ if __name__ == "__main__":
 
     ctx = mp.get_context("spawn")
     model.share_memory()  # Prepares model tensors for cross-process memory mapping
-    pool = ctx.Pool(processes=20)  # Persistent torch.mp worker pool
+    pool = ctx.Pool(processes=50)  # Persistent torch.mp worker pool
     wandb.init(project="ptcg-rl", name="transformer-mcts-training")
 
     for counter in range(500):
@@ -273,7 +279,6 @@ if __name__ == "__main__":
         with torch.inference_mode():
             # Evaluation
             results = [0, 0, 0]
-            model.to(device)
 
             start_time = time.perf_counter()
             total_samples = 0
@@ -292,7 +297,7 @@ if __name__ == "__main__":
                 samples, action_log, obs_log, game_result, vis = async_res.get()
 
                 file_idx = len(list(vis_savedir.iterdir()))
-                with open(vis_savedir / f"vis{file_idx}.json", "w") as file:
+                with open(vis_savedir / f"vis_val{file_idx}.json", "w") as file:
                     json.dump(vis, file)
 
                 if game_result["current"]["result"] == 2:  # Draw
@@ -325,7 +330,7 @@ if __name__ == "__main__":
             print(f"Evaluation win rate {win_rate}%", flush=True)
             print(elo.summary())
             elo.save_json(elo_data_path)
-
+            results_train = [0, 0, 0]
             async_train_results = []
             for _ in range(100):
                 player2 = select_player2_train()
@@ -339,25 +344,44 @@ if __name__ == "__main__":
                 async_train_results, desc=f"Data Collecting Epoch {counter}..."
             ):
                 samples, _, _, game_result, vis = async_res.get()
+
                 with open(
-                    vis_savedir / f"vis{len(list(vis_savedir.iterdir()))}.json", "w"
+                    vis_savedir / f"vis_train{len(list(vis_savedir.iterdir()))}.json",
+                    "w",
                 ) as file:
                     json.dump(vis, file)
+                if game_result["current"]["result"] == 2:  # Draw
+                    results_train[2] += 1
+                elif game_result["current"]["result"] == 0:  # Win
+                    results_train[0] += 1
+                else:  # Loss
+                    results_train[1] += 1
                 # Calculate the training labels and add them to the training data list.
                 for i in range(2):
-                    LAMBDA = 0.9
-                    # The final value is 1.0 for a win and -1.0 for a loss.
+                    LAMBDA = 0.95
                     if game_result["current"]["result"] == 2:
                         final_outcome = 0.0
                     else:
                         final_outcome = (
                             1.0 if i == game_result["current"]["result"] else -1.0
                         )
-                    for sample in samples[i]:
-                        sample.value = final_outcome
+
+                    # Run backward from the final move to the opening move
+                    current_value = final_outcome
+                    for sample in reversed(samples[i]):
+                        sample.value = current_value
                         sample_list.append(sample)
-        # Move back from cpu
-        model.to(device)
+                        current_value *= LAMBDA
+        win_rate_train = (
+            100 * results_train[0] // (results_train[0] + results_train[1])
+            if (results_train[0] + results_train[1]) > 0
+            else 0
+        )
+        print(f"Train win rate against clone: {win_rate_train}%", flush=True)
+        if win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
+            model2.load_state_dict(model.state_dict())
+            torch.save(model2.state_dict(), model2_path)
+
         # Train on the training data collected through self-play.
         model.train()
         random.shuffle(sample_list)
@@ -439,7 +463,7 @@ if __name__ == "__main__":
 
             # Add to total loss
             ENTROPY_COEF = 0.02
-            loss = loss_enc + loss_dec - ENTROPY_COEF * entropy
+            loss = loss_enc * 10 + loss_dec - ENTROPY_COEF * entropy
 
             epoch_loss_enc += loss_enc.item()
             epoch_loss_dec += loss_dec.item()
@@ -468,6 +492,7 @@ if __name__ == "__main__":
         wandb.log(
             {
                 "eval_win_rate": win_rate,
+                "train_win_rate": win_rate_train,
                 "elo": current_elo,
                 "loss_encoder": avg_loss_enc,
                 "loss_decoder": avg_loss_dec,
