@@ -9,6 +9,7 @@ from tqdm import tqdm
 import torch
 import torch.nn
 import torch.optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from pathlib import Path
 
 from kaggle_ptcg_engine.ptcg.cg.api import (
@@ -39,6 +40,7 @@ SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
 BATCH_SIZE = 128
 ENTROPY_COEF = 0.02
 VALUE_LOSS_WEIGHT = 10
+TOTAL_EPOCHS = 500
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -150,11 +152,25 @@ decoder_size = (
 )  # Decoder input vocabulary size
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = transformer.MyModel(128, 2, 256, 1, 1).to(device)
-model2 = transformer.MyModel(128, 2, 256, 1, 1).to(device)
+model = transformer.MyModel(
+    d_model=256,
+    num_heads=8,
+    d_feedforward=1024,
+    num_layers_encoder=4,
+    num_layers_decoder=4,
+).to(device)
+
+model2 = transformer.MyModel(
+    d_model=256,
+    num_heads=8,
+    d_feedforward=1024,
+    num_layers_encoder=4,
+    num_layers_decoder=4,
+).to(device)
 model_path = weights_dir / "model.pth"
 model2_path = weights_dir / "model2.pth"
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS)
 loss_fn_enc = torch.nn.HuberLoss(delta=0.2)
 loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)
 
@@ -213,7 +229,7 @@ if __name__ == "__main__":
             start_epoch = int(f.read())
     else:
         start_epoch = 0
-    for epoch in range(start_epoch, 500):
+    for epoch in range(start_epoch, TOTAL_EPOCHS):
         is_imitating = epoch < IMITATION_EPOCHS
         sample_list: list[transformer.LearnSample] = []
 
@@ -486,3 +502,4 @@ if __name__ == "__main__":
         torch.save(model.state_dict(), model_path)
         with open(results_dir / "epoch.txt", "w+") as f:
             f.write(str(epoch))
+        lr_scheduler.step()

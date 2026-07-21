@@ -40,22 +40,44 @@ decoder_size = (
 
 # Decoder Layer of MyModel
 class DecoderLayer(torch.nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_feedforward: int):
-        super(DecoderLayer, self).__init__()
+    def __init__(
+        self, d_model: int, num_heads: int, d_feedforward: int, dropout: float = 0.1
+    ):
+        super().__init__()
+        self.self_attn = torch.nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout
+        )
+        self.cross_attn = torch.nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout
+        )
 
-        self.attention = torch.nn.MultiheadAttention(d_model, num_heads)
-        self.fc1 = torch.nn.Linear(d_model, d_feedforward)
-        self.fc2 = torch.nn.Linear(d_feedforward, d_model)
+        self.linear1 = torch.nn.Linear(d_model, d_feedforward)
+        self.linear2 = torch.nn.Linear(d_feedforward, d_model)
+
         self.norm1 = torch.nn.LayerNorm(d_model)
         self.norm2 = torch.nn.LayerNorm(d_model)
+        self.norm3 = torch.nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, encoder_out: torch.Tensor) -> torch.Tensor:
-        y, _ = self.attention(x, encoder_out, encoder_out, need_weights=False)
-        res = self.norm1(x + y)
-        y = self.fc1(res)
-        y = torch.nn.functional.relu(y)
-        y = self.fc2(y)
-        return self.norm2(res + y)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.activation = torch.nn.GELU()
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        # Pre-LN Self Attention
+        x_norm = self.norm1(x)
+        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+        x = x + self.dropout(attn_out)
+
+        # Pre-LN Cross Attention
+        x_norm = self.norm2(x)
+        attn_out, _ = self.cross_attn(x_norm, memory, memory)
+        x = x + self.dropout(attn_out)
+
+        # Pre-LN Feedforward
+        x_norm = self.norm3(x)
+        ff_out = self.linear2(self.dropout(self.activation(self.linear1(x_norm))))
+        x = x + self.dropout(ff_out)
+
+        return x
 
 
 # My Transformer Model

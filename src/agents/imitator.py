@@ -1,4 +1,3 @@
-import typing
 from transformer_mcts import transformer
 from cg.api import to_observation_class
 
