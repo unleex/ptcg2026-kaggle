@@ -14,7 +14,7 @@ from cg.api import (
     to_observation_class,
 )
 
-SEARCH_COUNT = 50  # MCTS Search count
+SEARCH_COUNT = 100  # MCTS Search count
 
 
 # MCTS Node Child

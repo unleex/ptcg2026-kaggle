@@ -23,12 +23,22 @@ from kaggle_ptcg_engine.ptcg.cg.game import (
     visualize_data,
 )
 import transformer_mcts.transformer as transformer
+from agents.imitator import ImitationModel
 from transformer_mcts.mcts import mcts_agent
 from elo import EloRating
 from agents.rule_based_lucario import (
     agent as rule_based_lucario_agent,
     my_deck as mega_lucario_ex_deck,
 )
+
+# --- Configuration Constants ---
+IMITATION_EPOCHS = (
+    50  # Number of epochs to run imitation learning before switching to MCTS
+)
+SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
+BATCH_SIZE = 128
+ENTROPY_COEF = 0.02
+VALUE_LOSS_WEIGHT = 10
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -50,14 +60,13 @@ class LearnInput:
             self.offset.append(o + count)
 
 
-def play_and_collect_samples(player1, player2):
-    """
-    Play one game and return obtained LearnSamples when needed
-    -----
-    Returns
-    samples: list of length 2: samples for player 1, and samples for player 2. If some player is not trainable, their samples will be empty
-    obs: last observation that concludes the game
-    """
+def play_and_collect_samples(player1: Player, player2: Player):
+    """Play one game and return obtained LearnSamples when needed."""
+    if hasattr(player1.model, "reset"):
+        player1.model.reset()
+    if hasattr(player2.model, "reset"):
+        player2.model.reset()
+
     obs_log = [""]
     action_log = [None]
     obs, start_data = battle_start(player1.deck, player2.deck)
@@ -83,93 +92,35 @@ def play_and_collect_samples(player1, player2):
         if your_index == 0:
             # We play as index 0, generate MCTS actions and training samples
             selected, sample = player1(obs)
-            if player1.is_trainable:
-                samples[obs["current"]["yourIndex"]].append(sample)
-
+            if player1.is_trainable and sample is not None:
+                samples[0].append(sample)
         else:
             selected, sample = player2(obs)
-            if player2.is_trainable:
-                samples[obs["current"]["yourIndex"]].append(sample)
+            if player2.is_trainable and sample is not None:
+                samples[1].append(sample)
 
         obs_log.append(obs)
         action_log.append(selected)
         obs = battle_select(selected)
 
-    # For visualiation
+    # Compile trajectory sequences if running an imitation agent wrapper
+    if hasattr(player1.model, "post_process_samples") and player1.is_trainable:
+        samples[0] = player1.model.post_process_samples(obs["current"]["result"])
+    if hasattr(player2.model, "post_process_samples") and player2.is_trainable:
+        samples[1] = player2.model.post_process_samples(obs["current"]["result"])
+
     vis = json.loads(visualize_data())
     for i in range(len(vis)):
         vis[i]["obs"] = obs_log[i]
         vis[i]["action"] = [action_log[i], action_log[i]]
-    battle_finish()  # Finalize the game.
+    battle_finish()
     return samples, action_log, obs_log, obs, vis
 
 
-# A sample deck for training.
-snowy_deck = [
-    721,
-    721,
-    722,
-    722,
-    722,
-    722,
-    723,
-    723,
-    723,
-    723,
-    1092,
-    1121,
-    1121,
-    1145,
-    1145,
-    1163,
-    1163,
-    1219,
-    1219,
-    1219,
-    1219,
-    1227,
-    1227,
-    1227,
-    1227,
-    1262,
-    1262,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-    3,
-]
-
-results_dir = Path("results_fixed_lambda")
-results_dir.mkdir(exist_ok=True)
+# Environment setup structures
+RUN_NAME = "broad_search"
+results_dir = Path("results") / RUN_NAME
+results_dir.mkdir(exist_ok=True, parents=True)
 weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
 vis_savedir = results_dir / Path("visuals")
@@ -198,15 +149,14 @@ decoder_size = (
     + (1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION) * card_count
 )  # Decoder input vocabulary size
 
-SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = transformer.MyModel(128, 2, 256, 1, 1).to(device)
 model2 = transformer.MyModel(128, 2, 256, 1, 1).to(device)
 model_path = weights_dir / "model.pth"
 model2_path = weights_dir / "model2.pth"
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-loss_fn_enc = torch.nn.HuberLoss(delta=0.2)  # Encoder loss function
-loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)  # Decoder loss function
+loss_fn_enc = torch.nn.HuberLoss(delta=0.2)
+loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)
 
 elo = EloRating(initial=600)
 elo_data_path = results_dir / "elo.json"
@@ -243,16 +193,6 @@ player_lucario = Player(
     is_trainable=False,
 )
 
-
-def select_player2_val():
-    return player_lucario
-
-
-def select_player2_train():
-    return player1
-
-
-# The main training loop.
 if __name__ == "__main__":
     if model_path.exists():
         print("❇️Restoring", model_path)
@@ -260,44 +200,76 @@ if __name__ == "__main__":
     if model2_path.exists():
         print("❇️Restoring", model2_path)
         model2.load_state_dict(torch.load(model2_path, weights_only=False))
-
     if elo_data_path.exists():
         print("❇️Restoring elo from", elo_data_path)
         elo.load_json(elo_data_path)
 
     ctx = mp.get_context("spawn")
-    model.share_memory()  # Prepares model tensors for cross-process memory mapping
-    pool = ctx.Pool(processes=50)  # Persistent torch.mp worker pool
-    wandb.init(project="ptcg-rl", name="transformer-mcts-training")
+    model.share_memory()
+    pool = ctx.Pool(processes=50)
+    wandb.init(project="ptcg-rl", name=RUN_NAME, resume="allow")
+    if (results_dir / "epoch.txt").exists():
+        with open(results_dir / "epoch.txt", "r") as f:
+            start_epoch = int(f.read())
+    else:
+        start_epoch = 0
+    for epoch in range(start_epoch, 500):
+        is_imitating = epoch < IMITATION_EPOCHS
+        sample_list: list[transformer.LearnSample] = []
 
-    for counter in range(500):
-        sample_list: list[
-            transformer.LearnSample
-        ] = []  # List of training data samples.
+        # Adjust execution modes dynamically based on pretraining phase state
+        if is_imitating:
+            print(f"--- Epoch {epoch}: IMITATION LEARNING PHASE ---", flush=True)
+            p1_active_model = ImitationModel(rule_based_lucario_agent, player1_deck)
+            p2_active_model = ImitationModel(rule_based_lucario_agent, player1_deck)
+
+            player1.model = p1_active_model
+            player1.is_trainable = True
+
+            # During pretraining, let both players learn from expert behaviors
+            train_partner = Player(
+                model=p2_active_model,
+                name="model_clone_pretrain",
+                deck=player1_deck,
+                is_trainable=True,
+            )
+            val_partner = player_lucario
+        else:
+            print(f"--- Epoch {epoch}: MCTS SELF-PLAY PHASE ---", flush=True)
+            player1.model = player1_model
+            player1.is_trainable = True
+
+            player2.model = player2_model
+            player2.is_trainable = False
+
+            train_partner = player2
+            val_partner = player_lucario
 
         model.eval()
         with torch.inference_mode():
-            # Evaluation
+            # Evaluation Phase
             results = [0, 0, 0]
-
             start_time = time.perf_counter()
             total_samples = 0
 
             async_eval_results = []
             for _ in range(50):
-                player2 = select_player2_val()
                 elo.register(player1.name)
-                elo.register(player2.name)
+                elo.register(val_partner.name)
                 async_eval_results.append(
-                    pool.apply_async(play_and_collect_samples, args=(player1, player2))
+                    pool.apply_async(
+                        play_and_collect_samples, args=(player1, val_partner)
+                    )
                 )
 
-            pbar = tqdm(async_eval_results, desc=f"Evaluating Epoch {counter}...")
+            pbar = tqdm(async_eval_results, desc=f"Evaluating Epoch {epoch}...")
             for async_res in pbar:
                 samples, action_log, obs_log, game_result, vis = async_res.get()
 
                 file_idx = len(list(vis_savedir.iterdir()))
-                with open(vis_savedir / f"vis_val{file_idx}.json", "w") as file:
+                with open(
+                    vis_savedir / f"vis_val_{epoch}_{file_idx}.json", "w"
+                ) as file:
                     json.dump(vis, file)
 
                 if game_result["current"]["result"] == 2:  # Draw
@@ -311,11 +283,10 @@ if __name__ == "__main__":
                     results[1] += 1
                 elo.update(
                     name_a=str(player1.name),
-                    name_b=str(player2.name),
+                    name_b=str(val_partner.name),
                     a_score=elo_our_score,
                 )
 
-                # Track real-time throughput
                 game_samples = sum(len(player_samples) for player_samples in samples)
                 total_samples += game_samples
                 elapsed = time.perf_counter() - start_time
@@ -330,62 +301,83 @@ if __name__ == "__main__":
             print(f"Evaluation win rate {win_rate}%", flush=True)
             print(elo.summary())
             elo.save_json(elo_data_path)
+
+            # Data Generation/Training Sampling Phase
             results_train = [0, 0, 0]
             async_train_results = []
             for _ in range(100):
-                player2 = select_player2_train()
                 elo.register(player1.name)
-                elo.register(player2.name)
-                async_train_results.append(
-                    pool.apply_async(play_and_collect_samples, args=(player1, player2))
-                )
+                elo.register(train_partner.name)
+
+                # Randomize seat options to eliminate engine first/second structural biases
+                if random.random() < 0.5:
+                    async_train_results.append(
+                        pool.apply_async(
+                            play_and_collect_samples, args=(player1, train_partner)
+                        )
+                    )
+                else:
+                    async_train_results.append(
+                        pool.apply_async(
+                            play_and_collect_samples, args=(train_partner, player1)
+                        )
+                    )
 
             for async_res in tqdm(
-                async_train_results, desc=f"Data Collecting Epoch {counter}..."
+                async_train_results, desc=f"Data Collecting Epoch {epoch}..."
             ):
                 samples, _, _, game_result, vis = async_res.get()
 
                 with open(
-                    vis_savedir / f"vis_train{len(list(vis_savedir.iterdir()))}.json",
+                    vis_savedir
+                    / f"vis_train_{epoch}_{len(list(vis_savedir.iterdir()))}.json",
                     "w",
                 ) as file:
                     json.dump(vis, file)
-                if game_result["current"]["result"] == 2:  # Draw
-                    results_train[2] += 1
-                elif game_result["current"]["result"] == 0:  # Win
-                    results_train[0] += 1
-                else:  # Loss
-                    results_train[1] += 1
-                # Calculate the training labels and add them to the training data list.
-                for i in range(2):
-                    LAMBDA = 0.95
-                    if game_result["current"]["result"] == 2:
-                        final_outcome = 0.0
-                    else:
-                        final_outcome = (
-                            1.0 if i == game_result["current"]["result"] else -1.0
-                        )
 
-                    # Run backward from the final move to the opening move
-                    current_value = final_outcome
-                    for sample in reversed(samples[i]):
-                        sample.value = current_value
-                        sample_list.append(sample)
-                        current_value *= LAMBDA
+                if game_result["current"]["result"] == 2:
+                    results_train[2] += 1
+                elif game_result["current"]["result"] == 0:
+                    results_train[0] += 1
+                else:
+                    results_train[1] += 1
+
+                # Append collected experience batches directly into training lists
+                # If is_pretraining is True, post_process_samples has already populated these arrays
+                if not is_imitating:
+                    for i in range(2):
+                        LAMBDA = 0.95
+                        if game_result["current"]["result"] == 2:
+                            final_outcome = 0.0
+                        else:
+                            final_outcome = (
+                                1.0 if i == game_result["current"]["result"] else -1.0
+                            )
+
+                        current_value = final_outcome
+                        for sample in reversed(samples[i]):
+                            sample.value = current_value
+                            sample_list.append(sample)
+                            current_value *= LAMBDA
+                else:
+                    sample_list.extend(samples[0])
+                    sample_list.extend(samples[1])
+
         win_rate_train = (
             100 * results_train[0] // (results_train[0] + results_train[1])
             if (results_train[0] + results_train[1]) > 0
             else 0
         )
-        print(f"Train win rate against clone: {win_rate_train}%", flush=True)
-        if win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
+        print(f"Train win rate: {win_rate_train}%", flush=True)
+
+        if not is_imitating and win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
+            print("Updating checkpoint clone target model...", flush=True)
             model2.load_state_dict(model.state_dict())
             torch.save(model2.state_dict(), model2_path)
 
-        # Train on the training data collected through self-play.
+        # Gradient Optimization Step Phase
         model.train()
         random.shuffle(sample_list)
-        BATCH_SIZE = 128
         batch_count = len(sample_list) // BATCH_SIZE
 
         epoch_loss_enc = 0.0
@@ -394,8 +386,7 @@ if __name__ == "__main__":
         running_expl_var = 0.0
         running_kl_div = 0.0
 
-        for i in tqdm(range(batch_count), desc=f"Training Epoch {counter}..."):
-            # Prepare a batch of data.
+        for i in tqdm(range(batch_count), desc=f"Training Epoch {epoch}..."):
             input_enc = LearnInput()
             input_dec = LearnInput()
             mask = []
@@ -415,21 +406,18 @@ if __name__ == "__main__":
                     label_dec.append(0.0)
                     input_dec.offset.append(len(input_dec.index))
 
-            # Convert data to PyTorch tensors.
-            mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device)
-            mask_tensor = mask_tensor.view(BATCH_SIZE, -1)
+            mask_tensor = torch.tensor(mask, dtype=torch.float32, device=device).view(
+                BATCH_SIZE, -1
+            )
             label_tensor_enc = torch.tensor(
                 label_enc, dtype=torch.float32, device=device
-            )
-            label_tensor_enc = label_tensor_enc.view(BATCH_SIZE, -1)
+            ).view(BATCH_SIZE, -1)
             label_tensor_dec = torch.tensor(
                 label_dec, dtype=torch.float32, device=device
-            )
-            label_tensor_dec = label_tensor_dec.view(BATCH_SIZE, -1)
+            ).view(BATCH_SIZE, -1)
 
             optimizer.zero_grad()
 
-            # Get model predictions for the batch.
             out_enc, out_dec = model(
                 torch.tensor(input_enc.index, dtype=torch.int32, device=device),
                 torch.tensor(input_enc.value, dtype=torch.float32, device=device),
@@ -439,17 +427,13 @@ if __name__ == "__main__":
                 torch.tensor(input_dec.offset, dtype=torch.int32, device=device),
             )
 
-            # Calculate loss.
             loss_enc = loss_fn_enc(out_enc, label_tensor_enc)
             masked_logits = out_dec.masked_fill(mask_tensor == 0.0, -1e9)
             loss_dec = torch.nn.functional.cross_entropy(
                 masked_logits, label_tensor_dec, reduction="none"
-            )
-            loss_dec = loss_dec.mean()
-            # Calculate entropy of the network's output distribution
-            log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
+            ).mean()
 
-            # KL Divergence between MCTS target distribution and Network distribution
+            log_probs = torch.nn.functional.log_softmax(masked_logits, dim=-1)
             kl_div = torch.nn.functional.kl_div(
                 log_probs, label_tensor_dec, reduction="batchmean"
             )
@@ -461,19 +445,16 @@ if __name__ == "__main__":
                 .mean()
             )
 
-            # Add to total loss
-            ENTROPY_COEF = 0.02
-            loss = loss_enc * 10 + loss_dec - ENTROPY_COEF * entropy
+            loss = (loss_enc * VALUE_LOSS_WEIGHT) + loss_dec - (ENTROPY_COEF * entropy)
 
             epoch_loss_enc += loss_enc.item()
             epoch_loss_dec += loss_dec.item()
             entropy_epoch += entropy.item()
 
-            # Backpropagate the loss and update model parameters.
             loss.backward()
-            # Prevent explosions
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+
             target_var = torch.var(label_tensor_enc)
             if target_var > 0:
                 explained_variance = (
@@ -483,10 +464,9 @@ if __name__ == "__main__":
                 explained_variance = torch.tensor(float("nan"))
             running_expl_var += explained_variance.item()
             running_kl_div += kl_div.item()
+
         avg_loss_enc = epoch_loss_enc / batch_count
         avg_loss_dec = epoch_loss_dec / batch_count
-
-        # Retrieve elo of player 1
         current_elo = elo.ratings[player1.name]
 
         wandb.log(
@@ -500,6 +480,9 @@ if __name__ == "__main__":
                 "loss_total": avg_loss_enc + avg_loss_dec,
                 "kl_div": running_kl_div / batch_count,
                 "expl_var": running_expl_var / batch_count,
+                "pretraining_phase": int(is_imitating),
             }
         )
         torch.save(model.state_dict(), model_path)
+        with open(results_dir / "epoch.txt", "w+") as f:
+            f.write(str(epoch))

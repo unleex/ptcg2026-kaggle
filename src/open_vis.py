@@ -91,13 +91,14 @@ class VisServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"Server Error reading JSON: {str(e)}".encode("utf-8"))
 
 
+server = HTTPServer(("", 0), VisServerHandler)
 print("--> Persistent Visualizer Server Active!")
-print("http://localhost:8089")
+print(f"http://localhost:{server.server_port}")
 print(f"Monitoring: '{file_path}' (Refresh tab to pull new modifications)")
 print("\nPress Ctrl+C to stop.")
 
 try:
-    HTTPServer(("", 8089), VisServerHandler).serve_forever()
+    server.serve_forever()
 except KeyboardInterrupt:
     print("\nShutting down visualizer server.")
     sys.exit(0)
