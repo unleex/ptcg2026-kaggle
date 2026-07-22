@@ -120,7 +120,7 @@ def play_and_collect_samples(player1: Player, player2: Player):
 
 
 # Environment setup structures
-RUN_NAME = "broad_search"
+RUN_NAME = "heavy"
 results_dir = Path("results") / RUN_NAME
 results_dir.mkdir(exist_ok=True, parents=True)
 weights_dir = results_dir / Path("out")
@@ -177,24 +177,28 @@ loss_fn_dec = torch.nn.HuberLoss(reduction="none", delta=0.1)
 elo = EloRating(initial=600)
 elo_data_path = results_dir / "elo.json"
 
+
 # ----- Players definition -----
+class MCTSAgentWrapper:
+    def __init__(
+        self, model: transformer.MyModel, deck: list[int], is_eval: bool = False
+    ):
+        self.model = model
+        self.deck = deck
+        self.is_eval = is_eval
+
+    def __call__(self, obs):
+        return mcts_agent(obs, self.deck, self.model, is_eval=self.is_eval)
+
 
 player1_deck = mega_lucario_ex_deck
 
+player1_mcts = MCTSAgentWrapper(model, player1_deck, is_eval=False)
+player2_mcts = MCTSAgentWrapper(model2, player1_deck, is_eval=False)
 
-def player1_model(obs):
-    return mcts_agent(obs, player1_deck, model)
-
-
-def player2_model(obs):
-    return mcts_agent(obs, player1_deck, model2)
-
-
-player1 = Player(
-    model=player1_model, name="model", deck=player1_deck, is_trainable=True
-)
+player1 = Player(model=player1_mcts, name="model", deck=player1_deck, is_trainable=True)
 player2 = Player(
-    model=player2_model, name="model2", deck=player1_deck, is_trainable=False
+    model=player2_mcts, name="model2", deck=player1_deck, is_trainable=False
 )
 
 
@@ -229,6 +233,8 @@ if __name__ == "__main__":
             start_epoch = int(f.read())
     else:
         start_epoch = 0
+    for _ in range(start_epoch):
+        lr_scheduler.step()
     for epoch in range(start_epoch, TOTAL_EPOCHS):
         is_imitating = epoch < IMITATION_EPOCHS
         sample_list: list[transformer.LearnSample] = []
@@ -236,13 +242,16 @@ if __name__ == "__main__":
         # Adjust execution modes dynamically based on pretraining phase state
         if is_imitating:
             print(f"--- Epoch {epoch}: IMITATION LEARNING PHASE ---", flush=True)
-            p1_active_model = ImitationModel(rule_based_lucario_agent, player1_deck)
-            p2_active_model = ImitationModel(rule_based_lucario_agent, player1_deck)
+            p1_active_model = ImitationModel(
+                rule_based_lucario_agent, player1_deck, epsilon=0
+            )
+            p2_active_model = ImitationModel(
+                rule_based_lucario_agent, player1_deck, epsilon=0
+            )
 
             player1.model = p1_active_model
             player1.is_trainable = True
 
-            # During pretraining, let both players learn from expert behaviors
             train_partner = Player(
                 model=p2_active_model,
                 name="model_clone_pretrain",
@@ -251,11 +260,15 @@ if __name__ == "__main__":
             )
             val_partner = player_lucario
         else:
+            # Reset upon new phase
+            if epoch == IMITATION_EPOCHS:
+                lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS)
+
             print(f"--- Epoch {epoch}: MCTS SELF-PLAY PHASE ---", flush=True)
-            player1.model = player1_model
+            player1.model = player1_mcts
             player1.is_trainable = True
 
-            player2.model = player2_model
+            player2.model = player2_mcts
             player2.is_trainable = False
 
             train_partner = player2
@@ -263,7 +276,10 @@ if __name__ == "__main__":
 
         model.eval()
         with torch.inference_mode():
-            # Evaluation Phase
+            # Evaluation Phase (deterministic / no noise)
+            player1_mcts.is_eval = True
+            player2_mcts.is_eval = True
+
             results = [0, 0, 0]
             start_time = time.perf_counter()
             total_samples = 0
@@ -319,13 +335,14 @@ if __name__ == "__main__":
             elo.save_json(elo_data_path)
 
             # Data Generation/Training Sampling Phase
+            player1_mcts.is_eval = False
+            player2_mcts.is_eval = False
             results_train = [0, 0, 0]
             async_train_results = []
             for _ in range(100):
                 elo.register(player1.name)
                 elo.register(train_partner.name)
 
-                # Randomize seat options to eliminate engine first/second structural biases
                 if random.random() < 0.5:
                     async_train_results.append(
                         pool.apply_async(

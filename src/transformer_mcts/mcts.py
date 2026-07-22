@@ -121,7 +121,10 @@ def create_node(
 
 # We will perform exploration using MCTS and select actions. At the same time, we will also generate training data.
 def mcts_agent(
-    obs_dict: dict, your_deck: list[int], model: transformer.MyModel
+    obs_dict: dict,
+    your_deck: list[int],
+    model: transformer.MyModel,
+    is_eval: bool = False,
 ) -> tuple[list[int], transformer.LearnSample]:
     obs = to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
@@ -129,43 +132,34 @@ def mcts_agent(
     active = state.players[1 - your_index].active
     search_state = search_begin(
         obs,
-        your_deck=random.sample(
-            your_deck, state.players[your_index].deckCount
-        ),  # Randomly select from deck.
-        your_prize=random.sample(
-            your_deck, len(state.players[your_index].prize)
-        ),  # Randomly select from deck.
-        opponent_deck=[1072]
-        * state.players[
-            1 - your_index
-        ].deckCount,  # Fill with Snorlax (There is no deep meaning).
-        opponent_prize=[1]
-        * len(
-            state.players[1 - your_index].prize
-        ),  # Fill with Basic Energy (There is no deep meaning)
-        opponent_hand=[1]
-        * state.players[1 - your_index].handCount,  # Fill with Basic Energy.
+        your_deck=random.sample(your_deck, state.players[your_index].deckCount),
+        your_prize=random.sample(your_deck, len(state.players[your_index].prize)),
+        opponent_deck=[1072] * state.players[1 - your_index].deckCount,
+        opponent_prize=[1] * len(state.players[1 - your_index].prize),
+        opponent_hand=[1] * state.players[1 - your_index].handCount,
         opponent_active=[1072] if len(active) > 0 and active[0] is None else [],
-    )  # Fill with Snorlax.
-    root, sample = create_node(
-        None, search_state, your_index, your_deck, model
-    )  # Create root node.
-    DIRICHLET_ALPHA = 0.3  # Typical for games with many actions
-
-    EXPLORATION_FRACTION = 0.25
-
-    noise = (
-        torch.distributions.dirichlet.Dirichlet(
-            torch.full((len(root.children),), DIRICHLET_ALPHA)
-        )
-        .sample()
-        .tolist()
     )
+    root, sample = create_node(None, search_state, your_index, your_deck, model)
 
-    for i, child in enumerate(root.children):
-        child.prob = (
-            child.prob * (1 - EXPLORATION_FRACTION) + noise[i] * EXPLORATION_FRACTION
+    # Apply Dirichlet exploration noise only during self-play data collection
+    if not is_eval and len(root.children) > 1:
+        DIRICHLET_ALPHA = 0.3
+        EXPLORATION_FRACTION = 0.25
+
+        noise = (
+            torch.distributions.dirichlet.Dirichlet(
+                torch.full((len(root.children),), DIRICHLET_ALPHA)
+            )
+            .sample()
+            .tolist()
         )
+
+        for i, child in enumerate(root.children):
+            child.prob = (
+                child.prob * (1 - EXPLORATION_FRACTION)
+                + noise[i] * EXPLORATION_FRACTION
+            )
+
     # Search
     for _ in range(SEARCH_COUNT):
         current = root
@@ -198,7 +192,7 @@ def mcts_agent(
                     current.backprop(current.value)
                     break
 
-    # Select the most visited node.
+    # Select the most visited node
     max_child = None
     max_visit = -1
     min_value = 10
