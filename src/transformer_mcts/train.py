@@ -33,14 +33,17 @@ from agents.rule_based_lucario import (
 )
 
 # --- Configuration Constants ---
-IMITATION_EPOCHS = (
-    50  # Number of epochs to run imitation learning before switching to MCTS
-)
+RUN_NAME = "expert"
+PRETRAIN_WEIGHTS_PATH = Path("results/imitated.pt")
+# Number of epochs to run imitation learning before switching to MCTS
+IMITATION_EPOCHS = 0
 SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
 BATCH_SIZE = 128
 ENTROPY_COEF = 0.02
 VALUE_LOSS_WEIGHT = 10
 TOTAL_EPOCHS = 500
+TRAIN_ITERATIONS = 100
+VAL_ITERATIONS = 50
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -120,14 +123,12 @@ def play_and_collect_samples(player1: Player, player2: Player):
 
 
 # Environment setup structures
-RUN_NAME = "heavy"
 results_dir = Path("results") / RUN_NAME
 results_dir.mkdir(exist_ok=True, parents=True)
 weights_dir = results_dir / Path("out")
 weights_dir.mkdir(exist_ok=True)
 vis_savedir = results_dir / Path("visuals")
 vis_savedir.mkdir(exist_ok=True)
-
 # Load all card data from the API's helper function
 all_card = all_card_data()
 # Create a lookup table (dictionary) to quickly access card data by its cardId
@@ -217,6 +218,10 @@ if __name__ == "__main__":
     if model_path.exists():
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(model_path, weights_only=False))
+    elif PRETRAIN_WEIGHTS_PATH.exists():
+        print("❇️Restoring", model_path)
+        model.load_state_dict(torch.load(PRETRAIN_WEIGHTS_PATH, weights_only=False))
+
     if model2_path.exists():
         print("❇️Restoring", model2_path)
         model2.load_state_dict(torch.load(model2_path, weights_only=False))
@@ -239,7 +244,6 @@ if __name__ == "__main__":
         is_imitating = epoch < IMITATION_EPOCHS
         sample_list: list[transformer.LearnSample] = []
 
-        # Adjust execution modes dynamically based on pretraining phase state
         if is_imitating:
             print(f"--- Epoch {epoch}: IMITATION LEARNING PHASE ---", flush=True)
             p1_active_model = ImitationModel(
@@ -252,7 +256,7 @@ if __name__ == "__main__":
             player1.model = p1_active_model
             player1.is_trainable = True
 
-            train_partner = Player(
+            pretrain_partner = Player(
                 model=p2_active_model,
                 name="model_clone_pretrain",
                 deck=player1_deck,
@@ -260,8 +264,8 @@ if __name__ == "__main__":
             )
             val_partner = player_lucario
         else:
-            # Reset upon new phase
             if epoch == IMITATION_EPOCHS:
+                torch.save(model.state_dict(), weights_dir / "imitated.pt")
                 lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS)
 
             print(f"--- Epoch {epoch}: MCTS SELF-PLAY PHASE ---", flush=True)
@@ -271,12 +275,11 @@ if __name__ == "__main__":
             player2.model = player2_mcts
             player2.is_trainable = False
 
-            train_partner = player2
             val_partner = player_lucario
 
         model.eval()
         with torch.inference_mode():
-            # Evaluation Phase (deterministic / no noise)
+            # Evaluation Phase
             player1_mcts.is_eval = True
             player2_mcts.is_eval = True
 
@@ -285,7 +288,7 @@ if __name__ == "__main__":
             total_samples = 0
 
             async_eval_results = []
-            for _ in range(50):
+            for _ in range(VAL_ITERATIONS):
                 elo.register(player1.name)
                 elo.register(val_partner.name)
                 async_eval_results.append(
@@ -334,12 +337,17 @@ if __name__ == "__main__":
             print(elo.summary())
             elo.save_json(elo_data_path)
 
-            # Data Generation/Training Sampling Phase
+            # Data Generation / Training Sampling Phase
             player1_mcts.is_eval = False
             player2_mcts.is_eval = False
             results_train = [0, 0, 0]
             async_train_results = []
-            for _ in range(100):
+            for _ in range(TRAIN_ITERATIONS):
+                if is_imitating:
+                    train_partner = pretrain_partner
+                else:
+                    train_partner = player_lucario
+
                 elo.register(player1.name)
                 elo.register(train_partner.name)
 
@@ -375,8 +383,6 @@ if __name__ == "__main__":
                 else:
                     results_train[1] += 1
 
-                # Append collected experience batches directly into training lists
-                # If is_pretraining is True, post_process_samples has already populated these arrays
                 if not is_imitating:
                     for i in range(2):
                         LAMBDA = 0.95
@@ -403,6 +409,19 @@ if __name__ == "__main__":
         )
         print(f"Train win rate: {win_rate_train}%", flush=True)
 
+        if is_imitating and win_rate >= 55:
+            print(
+                "Competence threshold reached. Switching to MCTS Self-Play next epoch!",
+                flush=True,
+            )
+            is_imitating = False
+            lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS - epoch)
+        elif not is_imitating and win_rate < 40:
+            print(
+                "Model collapsed. Reverting to Imitation Learning next epoch!",
+                flush=True,
+            )
+            is_imitating = True
         if not is_imitating and win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
             print("Updating checkpoint clone target model...", flush=True)
             model2.load_state_dict(model.state_dict())
@@ -514,6 +533,7 @@ if __name__ == "__main__":
                 "kl_div": running_kl_div / batch_count,
                 "expl_var": running_expl_var / batch_count,
                 "pretraining_phase": int(is_imitating),
+                "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
         torch.save(model.state_dict(), model_path)
