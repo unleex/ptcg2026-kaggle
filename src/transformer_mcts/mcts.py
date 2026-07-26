@@ -124,6 +124,10 @@ def mcts_agent(
     obs_dict: dict,
     your_deck: list[int],
     model: transformer.MyModel,
+    sample_opponent_deck: list[int],
+    sample_opponent_hand: list[int],
+    sample_opponent_prize: list[int],
+    sample_opponent_active_pokemon: int | None,
     is_eval: bool = False,
 ) -> tuple[list[int], transformer.LearnSample]:
     obs = to_observation_class(obs_dict)
@@ -134,10 +138,12 @@ def mcts_agent(
         obs,
         your_deck=random.sample(your_deck, state.players[your_index].deckCount),
         your_prize=random.sample(your_deck, len(state.players[your_index].prize)),
-        opponent_deck=[1072] * state.players[1 - your_index].deckCount,
-        opponent_prize=[1] * len(state.players[1 - your_index].prize),
-        opponent_hand=[1] * state.players[1 - your_index].handCount,
-        opponent_active=[1072] if len(active) > 0 and active[0] is None else [],
+        opponent_deck=sample_opponent_deck,
+        opponent_prize=sample_opponent_prize,
+        opponent_hand=sample_opponent_hand,
+        opponent_active=sample_opponent_active_pokemon
+        if len(active) > 0 and active[0] is None
+        else [],
     )
     root, sample = create_node(None, search_state, your_index, your_deck, model)
 
@@ -202,8 +208,7 @@ def mcts_agent(
                 max_child = child
                 max_visit = child.node.visit
             v = child.node.total / child.node.visit
-            if min_value > v:
-                min_value = v
+            min_value = min(min_value, v)
 
     # Generate training data
     sample.value = root.total / root.visit

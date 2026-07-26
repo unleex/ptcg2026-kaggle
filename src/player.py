@@ -16,3 +16,9 @@ class Player:
 
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
+
+    def reset():
+        return
+
+    def process_obs(self, obs):
+        return

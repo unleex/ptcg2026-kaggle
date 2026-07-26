@@ -1,40 +1,44 @@
-import time
-import torch.multiprocessing as mp
-from player import Player
 import json
 import random
-import wandb
-from tqdm import tqdm
+import time
+from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn
 import torch.optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from pathlib import Path
+from tqdm import tqdm
 
+import wandb
+from agents.imitator import ImitationModel
+from agents.ismcts import ISMCTSPlayer
+from agents.rule_based_lucario import (
+    agent as rule_based_lucario_agent,
+)
+from agents.rule_based_lucario import (
+    my_deck as mega_lucario_ex_deck,
+)
+from cg.api import to_observation_class
+from elo import EloRating
 from kaggle_ptcg_engine.ptcg.cg.api import (
     SelectContext,
     all_attack,
     all_card_data,
 )
 from kaggle_ptcg_engine.ptcg.cg.game import (
-    battle_start,
     battle_finish,
     battle_select,
+    battle_start,
     visualize_data,
 )
-import transformer_mcts.transformer as transformer
-from agents.imitator import ImitationModel
-from transformer_mcts.mcts import mcts_agent
-from elo import EloRating
-from agents.rule_based_lucario import (
-    agent as rule_based_lucario_agent,
-    my_deck as mega_lucario_ex_deck,
-)
+from methods.deck_prediction.hidden_card_sampler import SimpleSampler
+from player import Player
+from transformer_mcts import transformer
 
 # --- Configuration Constants ---
-RUN_NAME = "expert"
-PRETRAIN_WEIGHTS_PATH = Path("results/imitated.pt")
+RUN_NAME = "ismcts_test"
+PRETRAIN_WEIGHTS_PATH = None
 # Number of epochs to run imitation learning before switching to MCTS
 IMITATION_EPOCHS = 0
 SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
@@ -91,9 +95,14 @@ def play_and_collect_samples(player1: Player, player2: Player):
         [],
     ]  # [Player0 samples, Player1 samples]
     while True:
-        if obs["current"]["result"] >= 0:
+        obs_log.append(obs)
+        # move everything to dataclass bc dict is cringe
+        obs = to_observation_class(obs)
+        player1.process_obs(obs)
+        player2.process_obs(obs)
+        if obs.current.result >= 0:
             break
-        your_index = obs["current"]["yourIndex"]
+        your_index = obs.current.yourIndex
         if your_index == 0:
             # We play as index 0, generate MCTS actions and training samples
             selected, sample = player1(obs)
@@ -104,15 +113,14 @@ def play_and_collect_samples(player1: Player, player2: Player):
             if player2.is_trainable and sample is not None:
                 samples[1].append(sample)
 
-        obs_log.append(obs)
         action_log.append(selected)
         obs = battle_select(selected)
 
     # Compile trajectory sequences if running an imitation agent wrapper
     if hasattr(player1.model, "post_process_samples") and player1.is_trainable:
-        samples[0] = player1.model.post_process_samples(obs["current"]["result"])
+        samples[0] = player1.model.post_process_samples(obs.current.result)
     if hasattr(player2.model, "post_process_samples") and player2.is_trainable:
-        samples[1] = player2.model.post_process_samples(obs["current"]["result"])
+        samples[1] = player2.model.post_process_samples(obs.current.result)
 
     vis = json.loads(visualize_data())
     for i in range(len(vis)):
@@ -180,26 +188,26 @@ elo_data_path = results_dir / "elo.json"
 
 
 # ----- Players definition -----
-class MCTSAgentWrapper:
-    def __init__(
-        self, model: transformer.MyModel, deck: list[int], is_eval: bool = False
-    ):
-        self.model = model
-        self.deck = deck
-        self.is_eval = is_eval
-
-    def __call__(self, obs):
-        return mcts_agent(obs, self.deck, self.model, is_eval=self.is_eval)
-
-
 player1_deck = mega_lucario_ex_deck
 
-player1_mcts = MCTSAgentWrapper(model, player1_deck, is_eval=False)
-player2_mcts = MCTSAgentWrapper(model2, player1_deck, is_eval=False)
+player1 = ISMCTSPlayer(
+    model=model,
+    name="ismcts",
+    deck=player1_deck,
+    is_trainable=True,
+    search_count_per_sample=10,
+    sample_count=10,
+    sampler=SimpleSampler(opponent_deck=mega_lucario_ex_deck),
+)
 
-player1 = Player(model=player1_mcts, name="model", deck=player1_deck, is_trainable=True)
-player2 = Player(
-    model=player2_mcts, name="model2", deck=player1_deck, is_trainable=False
+player2 = ISMCTSPlayer(
+    model=model,
+    name="ismcts2",
+    deck=player1_deck,
+    is_trainable=True,
+    search_count_per_sample=10,
+    sample_count=10,
+    sampler=SimpleSampler(opponent_deck=mega_lucario_ex_deck),
 )
 
 
@@ -218,7 +226,7 @@ if __name__ == "__main__":
     if model_path.exists():
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(model_path, weights_only=False))
-    elif PRETRAIN_WEIGHTS_PATH.exists():
+    elif PRETRAIN_WEIGHTS_PATH is not None and PRETRAIN_WEIGHTS_PATH.exists():
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(PRETRAIN_WEIGHTS_PATH, weights_only=False))
 
@@ -269,20 +277,19 @@ if __name__ == "__main__":
                 lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS)
 
             print(f"--- Epoch {epoch}: MCTS SELF-PLAY PHASE ---", flush=True)
-            player1.model = player1_mcts
+            player1.model = model
             player1.is_trainable = True
 
-            player2.model = player2_mcts
+            player2.model = model
             player2.is_trainable = False
 
             val_partner = player_lucario
 
         model.eval()
+        player1.is_eval = True
+        player2.is_eval = True
         with torch.inference_mode():
             # Evaluation Phase
-            player1_mcts.is_eval = True
-            player2_mcts.is_eval = True
-
             results = [0, 0, 0]
             start_time = time.perf_counter()
             total_samples = 0
@@ -307,10 +314,10 @@ if __name__ == "__main__":
                 ) as file:
                     json.dump(vis, file)
 
-                if game_result["current"]["result"] == 2:  # Draw
+                if game_result.current.result == 2:  # Draw
                     elo_our_score = 0.5
                     results[2] += 1
-                elif game_result["current"]["result"] == 0:  # Win
+                elif game_result.current.result == 0:  # Win
                     elo_our_score = 1
                     results[0] += 1
                 else:  # Loss
@@ -338,8 +345,8 @@ if __name__ == "__main__":
             elo.save_json(elo_data_path)
 
             # Data Generation / Training Sampling Phase
-            player1_mcts.is_eval = False
-            player2_mcts.is_eval = False
+            player1.is_eval = False
+            player2.is_eval = False
             results_train = [0, 0, 0]
             async_train_results = []
             for _ in range(TRAIN_ITERATIONS):
@@ -376,9 +383,9 @@ if __name__ == "__main__":
                 ) as file:
                     json.dump(vis, file)
 
-                if game_result["current"]["result"] == 2:
+                if game_result.current.result == 2:
                     results_train[2] += 1
-                elif game_result["current"]["result"] == 0:
+                elif game_result.current.result == 0:
                     results_train[0] += 1
                 else:
                     results_train[1] += 1
@@ -386,11 +393,11 @@ if __name__ == "__main__":
                 if not is_imitating:
                     for i in range(2):
                         LAMBDA = 0.95
-                        if game_result["current"]["result"] == 2:
+                        if game_result.current.result == 2:
                             final_outcome = 0.0
                         else:
                             final_outcome = (
-                                1.0 if i == game_result["current"]["result"] else -1.0
+                                1.0 if i == game_result.current.result else -1.0
                             )
 
                         current_value = final_outcome
@@ -409,19 +416,6 @@ if __name__ == "__main__":
         )
         print(f"Train win rate: {win_rate_train}%", flush=True)
 
-        if is_imitating and win_rate >= 55:
-            print(
-                "Competence threshold reached. Switching to MCTS Self-Play next epoch!",
-                flush=True,
-            )
-            is_imitating = False
-            lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS - epoch)
-        elif not is_imitating and win_rate < 40:
-            print(
-                "Model collapsed. Reverting to Imitation Learning next epoch!",
-                flush=True,
-            )
-            is_imitating = True
         if not is_imitating and win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
             print("Updating checkpoint clone target model...", flush=True)
             model2.load_state_dict(model.state_dict())

@@ -184,7 +184,7 @@ def pokemon_score(pokemon: Pokemon) -> int:
     return score
 
 
-def agent(obs_dict: dict) -> list[int]:
+def agent(obs) -> list[int]:
     """Main Agent Function.
 
     Each element in the returned list must be >= 0 and < len(obs.select.option).
@@ -193,7 +193,6 @@ def agent(obs_dict: dict) -> list[int]:
     Returns:
         list[int]: A list of option index.
     """
-    obs = to_observation_class(obs_dict)
     if obs.select == None:
         # In the initial selection, the obs.select is None, and it is necessary to return the deck.
         # The deck is a list of 60 card IDs.
