@@ -24,8 +24,9 @@ attack_count = (
     max(all_attack(), key=lambda a: a.attackId).attackId + 1
 )  # Max Attack ID + 1
 
-num_words_encoder = 24
-encoder_size = 22000  # Encoder input size exceeding the vocabulary size
+num_words_encoder = 25
+# Calculate encoder size dynamically based on max feature index used by get_encoder_input
+encoder_size = 37 + 18 * (card_count + 1)
 
 decoder_main_feature = 8  # Feature count of SelectContext.Main
 decoder_attack_offset = 14  # First index of Attack feature
@@ -247,7 +248,7 @@ def get_encoder_input(
     sv.word_start()
     for id in your_deck:
         sv.add(id, 0.25)
-    sv.add_pos(card_count)
+    sv.add_pos(card_count + 1)  # +1 prevents SENTINEL_UNK from bleeding into Stadium
 
     sv.word_start()
     add_cards(sv, state.stadium, 1.0)
@@ -256,6 +257,21 @@ def get_encoder_input(
     sv.add_single(1)
     sv.add_single(state.turn / 10)
     sv.add_single(state.firstPlayer == your_index)
+    # Word 25: Opponent Known Hand + UNK tokens
+    sv.word_start()
+    opp_index = 1 - your_index
+    opp_ps = state.players[opp_index]
+
+    # Add known tracked card IDs
+    for card_id in known_opponents_hand_cards:
+        sv.add(card_id, 0.25)
+
+    # Add UNK tokens for remaining unknown cards in opponent hand
+    unknown_count = max(0, opp_ps.handCount - len(known_opponents_hand_cards))
+    for _ in range(unknown_count):
+        sv.add(SENTINEL_UNK, 0.25)
+
+    sv.add_pos(card_count + 1)  # +1 to accommodate SENTINEL_UNK
     return sv
 
 

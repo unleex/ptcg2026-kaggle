@@ -11,7 +11,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 import wandb
-from agents.imitator import ImitationModel
 from agents.ismcts import ISMCTSPlayer
 from agents.rule_based_lucario import (
     agent as rule_based_lucario_agent,
@@ -37,17 +36,15 @@ from player import Player
 from transformer_mcts import transformer
 
 # --- Configuration Constants ---
-RUN_NAME = "ismcts_test"
-PRETRAIN_WEIGHTS_PATH = None
-# Number of epochs to run imitation learning before switching to MCTS
-IMITATION_EPOCHS = 0
+RUN_NAME = "revealed_tracking"
+PRETRAIN_WEIGHTS_PATH = None  # Path("results/ismcts.pt")
 SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
 BATCH_SIZE = 128
 ENTROPY_COEF = 0.02
 VALUE_LOSS_WEIGHT = 10
 TOTAL_EPOCHS = 500
 TRAIN_ITERATIONS = 100
-VAL_ITERATIONS = 50
+VAL_ITERATIONS = 0
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -169,15 +166,15 @@ model = transformer.MyModel(
     num_layers_decoder=4,
 ).to(device)
 
-model2 = transformer.MyModel(
-    d_model=256,
-    num_heads=8,
-    d_feedforward=1024,
-    num_layers_encoder=4,
-    num_layers_decoder=4,
-).to(device)
+# model2 = transformer.MyModel(
+#     d_model=256,
+#     num_heads=8,
+#     d_feedforward=1024,
+#     num_layers_encoder=4,
+#     num_layers_decoder=4,
+# ).to(device)
 model_path = weights_dir / "model.pth"
-model2_path = weights_dir / "model2.pth"
+# model2_path = weights_dir / "model2.pth"
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS)
 loss_fn_enc = torch.nn.HuberLoss(delta=0.2)
@@ -193,16 +190,6 @@ player1_deck = mega_lucario_ex_deck
 player1 = ISMCTSPlayer(
     model=model,
     name="ismcts",
-    deck=player1_deck,
-    is_trainable=True,
-    search_count_per_sample=10,
-    sample_count=10,
-    sampler=SimpleSampler(opponent_deck=mega_lucario_ex_deck),
-)
-
-player2 = ISMCTSPlayer(
-    model=model,
-    name="ismcts2",
     deck=player1_deck,
     is_trainable=True,
     search_count_per_sample=10,
@@ -230,9 +217,9 @@ if __name__ == "__main__":
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(PRETRAIN_WEIGHTS_PATH, weights_only=False))
 
-    if model2_path.exists():
-        print("❇️Restoring", model2_path)
-        model2.load_state_dict(torch.load(model2_path, weights_only=False))
+    # if model2_path.exists():
+    #     print("❇️Restoring", model2_path)
+    #     model2.load_state_dict(torch.load(model2_path, weights_only=False))
     if elo_data_path.exists():
         print("❇️Restoring elo from", elo_data_path)
         elo.load_json(elo_data_path)
@@ -249,45 +236,16 @@ if __name__ == "__main__":
     for _ in range(start_epoch):
         lr_scheduler.step()
     for epoch in range(start_epoch, TOTAL_EPOCHS):
-        is_imitating = epoch < IMITATION_EPOCHS
         sample_list: list[transformer.LearnSample] = []
 
-        if is_imitating:
-            print(f"--- Epoch {epoch}: IMITATION LEARNING PHASE ---", flush=True)
-            p1_active_model = ImitationModel(
-                rule_based_lucario_agent, player1_deck, epsilon=0
-            )
-            p2_active_model = ImitationModel(
-                rule_based_lucario_agent, player1_deck, epsilon=0
-            )
+        print(f"--- Epoch {epoch}: MCTS SELF-PLAY PHASE ---", flush=True)
+        player1.model = model
+        player1.is_trainable = True
 
-            player1.model = p1_active_model
-            player1.is_trainable = True
-
-            pretrain_partner = Player(
-                model=p2_active_model,
-                name="model_clone_pretrain",
-                deck=player1_deck,
-                is_trainable=True,
-            )
-            val_partner = player_lucario
-        else:
-            if epoch == IMITATION_EPOCHS:
-                torch.save(model.state_dict(), weights_dir / "imitated.pt")
-                lr_scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_EPOCHS)
-
-            print(f"--- Epoch {epoch}: MCTS SELF-PLAY PHASE ---", flush=True)
-            player1.model = model
-            player1.is_trainable = True
-
-            player2.model = model
-            player2.is_trainable = False
-
-            val_partner = player_lucario
+        val_partner = player_lucario
 
         model.eval()
         player1.is_eval = True
-        player2.is_eval = True
         with torch.inference_mode():
             # Evaluation Phase
             results = [0, 0, 0]
@@ -346,32 +304,27 @@ if __name__ == "__main__":
 
             # Data Generation / Training Sampling Phase
             player1.is_eval = False
-            player2.is_eval = False
             results_train = [0, 0, 0]
             async_train_results = []
             for _ in range(TRAIN_ITERATIONS):
-                if is_imitating:
-                    train_partner = pretrain_partner
-                else:
-                    train_partner = player_lucario
+                train_partner = player_lucario
 
                 elo.register(player1.name)
                 elo.register(train_partner.name)
-
-                if random.random() < 0.5:
-                    async_train_results.append(
+                player1_goes_first = random.random() < 0.5
+                async_train_results.append(
+                    (
                         pool.apply_async(
-                            play_and_collect_samples, args=(player1, train_partner)
-                        )
+                            play_and_collect_samples,
+                            args=(player1, train_partner)
+                            if player1_goes_first
+                            else (train_partner, player1),
+                        ),
+                        player1_goes_first,
                     )
-                else:
-                    async_train_results.append(
-                        pool.apply_async(
-                            play_and_collect_samples, args=(train_partner, player1)
-                        )
-                    )
+                )
 
-            for async_res in tqdm(
+            for async_res, player1_goes_first in tqdm(
                 async_train_results, desc=f"Data Collecting Epoch {epoch}..."
             ):
                 samples, _, _, game_result, vis = async_res.get()
@@ -382,32 +335,30 @@ if __name__ == "__main__":
                     "w",
                 ) as file:
                     json.dump(vis, file)
-
+                p1_won = (
+                    game_result.current.result == 0
+                    if player1_goes_first
+                    else game_result.current.result == 1
+                )
                 if game_result.current.result == 2:
                     results_train[2] += 1
-                elif game_result.current.result == 0:
+                elif p1_won:
                     results_train[0] += 1
                 else:
                     results_train[1] += 1
 
-                if not is_imitating:
-                    for i in range(2):
-                        LAMBDA = 0.95
-                        if game_result.current.result == 2:
-                            final_outcome = 0.0
-                        else:
-                            final_outcome = (
-                                1.0 if i == game_result.current.result else -1.0
-                            )
+                for i in range(2):
+                    LAMBDA = 0.95
+                    if game_result.current.result == 2:
+                        final_outcome = 0.0
+                    else:
+                        final_outcome = 1.0 if i == game_result.current.result else -1.0
 
-                        current_value = final_outcome
-                        for sample in reversed(samples[i]):
-                            sample.value = current_value
-                            sample_list.append(sample)
-                            current_value *= LAMBDA
-                else:
-                    sample_list.extend(samples[0])
-                    sample_list.extend(samples[1])
+                    current_value = final_outcome
+                    for sample in reversed(samples[i]):
+                        sample.value = current_value
+                        sample_list.append(sample)
+                        current_value *= LAMBDA
 
         win_rate_train = (
             100 * results_train[0] // (results_train[0] + results_train[1])
@@ -416,10 +367,10 @@ if __name__ == "__main__":
         )
         print(f"Train win rate: {win_rate_train}%", flush=True)
 
-        if not is_imitating and win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
+        if win_rate_train > SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH:
             print("Updating checkpoint clone target model...", flush=True)
-            model2.load_state_dict(model.state_dict())
-            torch.save(model2.state_dict(), model2_path)
+            # model2.load_state_dict(model.state_dict())
+            # torch.save(model2.state_dict(), model2_path)
 
         # Gradient Optimization Step Phase
         model.train()
@@ -526,7 +477,6 @@ if __name__ == "__main__":
                 "loss_total": avg_loss_enc + avg_loss_dec,
                 "kl_div": running_kl_div / batch_count,
                 "expl_var": running_expl_var / batch_count,
-                "pretraining_phase": int(is_imitating),
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )

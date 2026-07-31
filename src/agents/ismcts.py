@@ -12,7 +12,7 @@ from cg.api import (
     search_step,
 )
 from player import Player
-from transformer_mcts.mcts import create_node
+from transformer_mcts.mcts import create_node, mcts_agent
 
 
 class ISMCTSPlayer(Player):
@@ -44,7 +44,6 @@ class ISMCTSPlayer(Player):
 
     def __call__(self, obs: Observation) -> tuple[list[int], typing.Any]:
         self.process_obs(obs)
-
         your_index = obs.current.yourIndex
         state = obs.current
         your_state = state.players[your_index]
@@ -72,7 +71,12 @@ class ISMCTSPlayer(Player):
             )
 
             root, sample = create_node(
-                None, search_state, your_index, self.deck, self.model
+                None,
+                search_state,
+                your_index,
+                self.deck,
+                self.model,
+                known_opponents_hand_cards=self.sampler.tracker.get_known_hand_card_ids(),
             )
 
             # Setup tracking variables on the first sample pass
@@ -125,7 +129,12 @@ class ISMCTSPlayer(Player):
                             current.state.searchId, next_child.select
                         )
                         next_child.node, _ = create_node(
-                            current, step_state, your_index, self.deck, self.model
+                            current,
+                            step_state,
+                            your_index,
+                            self.deck,
+                            self.model,
+                            known_opponents_hand_cards=self.sampler.tracker.get_known_hand_card_ids(),
                         )
                         break
                     else:

@@ -60,6 +60,7 @@ def create_node(
     your_index: int,
     your_deck: list[int],
     model: transformer.MyModel,
+    known_opponents_hand_cards: list[int],
 ) -> tuple[Node, transformer.LearnSample | None]:
     node = Node(parent, search_state)
 
@@ -93,12 +94,19 @@ def create_node(
         # Determine which deck to pass based on who is active in this simulation step
         if obs.current.yourIndex == your_index:
             current_deck = your_deck
+            known_non_active_hand = known_opponents_hand_cards
         else:
-            # Use the simulated Snorlax deck we initialized in search_begin.
             opponent_active_index = obs.current.yourIndex
-            current_deck = [1072] * obs.current.players[opponent_active_index].deckCount
+            current_deck = [transformer.SENTINEL_UNK] * obs.current.players[
+                opponent_active_index
+            ].deckCount
+            known_non_active_hand = []
 
-        sv_enc = transformer.get_encoder_input(obs, current_deck)
+        sv_enc = transformer.get_encoder_input(
+            obs,
+            current_deck,
+            known_opponents_hand_cards=known_non_active_hand,
+        )
         sv_dec = transformer.get_decoder_input(obs, actions)
         value, policy = transformer.eval_nn(sv_enc, sv_dec, model)
         v = value
@@ -130,7 +138,7 @@ def mcts_agent(
     sample_opponent_active_pokemon: int | None,
     is_eval: bool = False,
 ) -> tuple[list[int], transformer.LearnSample]:
-    obs = to_observation_class(obs_dict)
+    obs = obs_dict  # to_observation_class(obs_dict)
     your_index = obs.current.yourIndex
     state = obs.current
     active = state.players[1 - your_index].active
@@ -145,7 +153,7 @@ def mcts_agent(
         if len(active) > 0 and active[0] is None
         else [],
     )
-    root, sample = create_node(None, search_state, your_index, your_deck, model)
+    root, sample = create_node(None, search_state, your_index, your_deck, model, [])
 
     # Apply Dirichlet exploration noise only during self-play data collection
     if not is_eval and len(root.children) > 1:
@@ -189,7 +197,7 @@ def mcts_agent(
             if next.node is None:
                 search_state = search_step(current.state.searchId, next.select)
                 next.node, _ = create_node(
-                    current, search_state, your_index, your_deck, model
+                    current, search_state, your_index, your_deck, model, []
                 )
                 break
             else:
