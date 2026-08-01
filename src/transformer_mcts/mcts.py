@@ -1,20 +1,20 @@
-import torch
 import math
+import random
+import typing
+from collections import Counter
 
+import torch
+
+import transformer_mcts.transformer as transformer
 from cg.api import (
     SearchState,
-)
-import transformer_mcts.transformer as transformer
-import random
-
-from cg.api import (
     search_begin,
     search_end,
     search_step,
     to_observation_class,
 )
-
-SEARCH_COUNT = 70
+from player import Player
+from utils.utils import get_public_cards
 
 
 # MCTS Node Child
@@ -59,6 +59,7 @@ def create_node(
     search_state: SearchState,
     your_index: int,
     your_deck: list[int],
+    opponents_deck: list[int],
     model: transformer.MyModel,
 ) -> tuple[Node, transformer.LearnSample | None]:
     node = Node(parent, search_state)
@@ -91,12 +92,9 @@ def create_node(
                 break
 
         # Determine which deck to pass based on who is active in this simulation step
-        if obs.current.yourIndex == your_index:
-            current_deck = your_deck
-        else:
-            # Use the simulated Snorlax deck we initialized in search_begin.
-            opponent_active_index = obs.current.yourIndex
-            current_deck = [1072] * obs.current.players[opponent_active_index].deckCount
+        current_deck = (
+            your_deck if obs.current.yourIndex == your_index else opponents_deck
+        )
 
         sv_enc = transformer.get_encoder_input(obs, current_deck)
         sv_dec = transformer.get_decoder_input(obs, actions)
@@ -119,104 +117,171 @@ def create_node(
     return (node, sample)
 
 
-# We will perform exploration using MCTS and select actions. At the same time, we will also generate training data.
-def mcts_agent(
-    obs_dict: dict,
-    your_deck: list[int],
-    model: transformer.MyModel,
-    is_eval: bool = False,
-) -> tuple[list[int], transformer.LearnSample]:
-    obs = to_observation_class(obs_dict)
-    your_index = obs.current.yourIndex
-    state = obs.current
-    active = state.players[1 - your_index].active
-    search_state = search_begin(
-        obs,
-        your_deck=random.sample(your_deck, state.players[your_index].deckCount),
-        your_prize=random.sample(your_deck, len(state.players[your_index].prize)),
-        opponent_deck=[1072] * state.players[1 - your_index].deckCount,
-        opponent_prize=[1] * len(state.players[1 - your_index].prize),
-        opponent_hand=[1] * state.players[1 - your_index].handCount,
-        opponent_active=[1072] if len(active) > 0 and active[0] is None else [],
-    )
-    root, sample = create_node(None, search_state, your_index, your_deck, model)
+class ISMCTSPlayer(Player):
+    def __init__(
+        self,
+        model: typing.Callable,
+        name: str,
+        deck: list[int],
+        sampler: typing.Any,
+        sample_count: int = 10,
+        search_count_per_sample: int = 10,
+        c_puct: float = 0.4,
+        is_trainable: bool = True,
+    ):
+        super().__init__(model=model, name=name, deck=deck, is_trainable=is_trainable)
+        self.sampler = sampler
+        self.sample_count = sample_count
+        self.search_count_per_sample = search_count_per_sample
+        self.c_puct = c_puct
+        self.is_eval = False
 
-    # Apply Dirichlet exploration noise only during self-play data collection
-    if not is_eval and len(root.children) > 1:
-        DIRICHLET_ALPHA = 0.3
-        EXPLORATION_FRACTION = 0.25
+    def reset(self):
+        if hasattr(self.sampler, "reset"):
+            self.sampler.reset()
 
-        noise = (
-            torch.distributions.dirichlet.Dirichlet(
-                torch.full((len(root.children),), DIRICHLET_ALPHA)
+    def process_obs(self, obs):
+        if hasattr(self.sampler, "update"):
+            self.sampler.update(obs)
+
+    # We will perform exploration using MCTS and select actions. At the same time, we will also generate training data.
+    def mcts_agent(
+        self,
+        obs_dict: dict,
+        your_deck: list[int],
+        model: transformer.MyModel,
+        is_eval: bool = False,
+    ) -> tuple[list[int], transformer.LearnSample]:
+        obs = to_observation_class(obs_dict)
+        your_index = obs.current.yourIndex
+        state = obs.current
+        aggregated_value = 0
+        aggregated_visits = {}
+        for sample_idx in range(self.sample_count):
+            your_public_cards = get_public_cards(player_state=state.players[your_index])
+            stadium_card = state.stadium
+            if stadium_card and stadium_card[0].playerIndex == your_index:
+                your_public_cards.append(stadium_card[0].id)
+            remaining = Counter(your_deck) - Counter(your_public_cards)
+            your_sampled_deck = random.sample(
+                list(remaining.elements()), state.players[your_index].deckCount
             )
-            .sample()
-            .tolist()
-        )
-
-        for i, child in enumerate(root.children):
-            child.prob = (
-                child.prob * (1 - EXPLORATION_FRACTION)
-                + noise[i] * EXPLORATION_FRACTION
+            remaining -= Counter(your_sampled_deck)
+            your_sampled_prize = random.sample(
+                list(remaining.elements()), len(state.players[your_index].prize)
             )
+            opp_cards = self.sampler.sample_opponent(obs)
+            search_state = search_begin(
+                obs,
+                your_deck=your_sampled_deck,
+                your_prize=your_sampled_prize,
+                opponent_deck=opp_cards["deck"],
+                opponent_prize=opp_cards["prize"],
+                opponent_hand=opp_cards["hand"],
+                opponent_active=opp_cards["hidden_active"],
+            )
+            root, sample = create_node(
+                parent=None,
+                search_state=search_state,
+                your_index=your_index,
+                your_deck=your_deck,
+                opponents_deck=opp_cards["deck"],
+                model=model,
+            )
+            if sample_idx == 0:
+                final_sample = sample
+                root_actions = [tuple(c.select) for c in root.children]
+                for action in root_actions:
+                    aggregated_visits[action] = 0
+            # Apply Dirichlet exploration noise only during self-play data collection
+            if not is_eval and len(root.children) > 1:
+                DIRICHLET_ALPHA = 0.3
+                EXPLORATION_FRACTION = 0.25
 
-    # Search
-    for _ in range(SEARCH_COUNT):
-        current = root
-        while True:
-            value = -1e9
-            c = 0.4 * math.sqrt(current.visit)
-            for child in current.children:
-                visit = 0
-                if child.node is None:
-                    v = current.total / current.visit
-                else:
-                    v = child.node.total / child.node.visit
-                    visit = child.node.visit
-                if current.state.observation.current.yourIndex != your_index:
-                    v = -v
-                v += c * child.prob / (1 + visit)
-                if value < v:
-                    value = v
-                    next = child
-
-            if next.node is None:
-                search_state = search_step(current.state.searchId, next.select)
-                next.node, _ = create_node(
-                    current, search_state, your_index, your_deck, model
+                noise = (
+                    torch.distributions.dirichlet.Dirichlet(
+                        torch.full((len(root.children),), DIRICHLET_ALPHA)
+                    )
+                    .sample()
+                    .tolist()
                 )
-                break
+
+                for i, child in enumerate(root.children):
+                    child.prob = (
+                        child.prob * (1 - EXPLORATION_FRACTION)
+                        + noise[i] * EXPLORATION_FRACTION
+                    )
+
+            # Search
+            for _ in range(self.search_count_per_sample):
+                current = root
+                while True:
+                    value = -1e9
+                    c = 0.4 * math.sqrt(current.visit)
+                    for child in current.children:
+                        visit = 0
+                        if child.node is None:
+                            v = current.total / current.visit
+                        else:
+                            v = child.node.total / child.node.visit
+                            visit = child.node.visit
+                        if current.state.observation.current.yourIndex != your_index:
+                            v = -v
+                        v += c * child.prob / (1 + visit)
+                        if value < v:
+                            value = v
+                            next = child
+
+                    if next.node is None:
+                        search_state = search_step(current.state.searchId, next.select)
+                        next.node, _ = create_node(
+                            parent=current,
+                            search_state=search_state,
+                            your_index=your_index,
+                            your_deck=your_deck,
+                            opponents_deck=opp_cards["deck"],
+                            model=model,
+                        )
+                        break
+                    else:
+                        current = next.node
+                        if current.state.observation.current.result >= 0:
+                            current.backprop(current.value)
+                            break
+
+            # Generate training data
+            sample.value = root.total / root.visit
+            visits = [
+                child.node.visit if child.node is not None else 0
+                for child in root.children
+            ]
+            sum_visits = sum(visits)
+            if sum_visits > 0:
+                for i in range(len(root.children)):
+                    sample.policy[i] = visits[i] / sum_visits
             else:
-                current = next.node
-                if current.state.observation.current.result >= 0:
-                    current.backprop(current.value)
-                    break
+                for i in range(len(root.children)):
+                    sample.policy[i] = 1.0 / len(root.children)
+            for child in root.children:
+                if child.node is not None:
+                    action_tuple = tuple(child.select)
+                    if action_tuple in aggregated_visits:
+                        aggregated_visits[action_tuple] += child.node.visit
 
-    # Select the most visited node
-    max_child = None
-    max_visit = -1
-    min_value = 10
-    for child in root.children:
-        if child.node is not None:
-            if max_visit < child.node.visit:
-                max_child = child
-                max_visit = child.node.visit
-            v = child.node.total / child.node.visit
-            if min_value > v:
-                min_value = v
+            if root.visit > 0:
+                aggregated_value += root.total / root.visit
 
-    # Generate training data
-    sample.value = root.total / root.visit
-    visits = [
-        child.node.visit if child.node is not None else 0 for child in root.children
-    ]
-    sum_visits = sum(visits)
-    if sum_visits > 0:
-        for i in range(len(root.children)):
-            sample.policy[i] = visits[i] / sum_visits
-    else:
-        for i in range(len(root.children)):
-            sample.policy[i] = 1.0 / len(root.children)
+            search_end()
+        best_action = max(aggregated_visits, key=aggregated_visits.get)
+        total_visits = sum(aggregated_visits.values())
+        if total_visits > 0:
+            for i, action in enumerate(root_actions):
+                final_sample.policy[i] = aggregated_visits[action] / total_visits
+        else:
+            for i in range(len(root_actions)):
+                final_sample.policy[i] = 1.0 / len(root_actions)
 
-    search_end()
-    return (max_child.select, sample)
+        return (list(best_action), final_sample)
+
+    def __call__(self, obs):
+        return self.mcts_agent(obs, self.deck, self.model, self.is_eval)

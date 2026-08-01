@@ -17,6 +17,7 @@ from agents.rule_based_lucario import (
 from agents.rule_based_lucario import (
     my_deck as mega_lucario_ex_deck,
 )
+from cg.api import to_observation_class
 from elo import EloRating
 from kaggle_ptcg_engine.ptcg.cg.api import (
     SelectContext,
@@ -29,13 +30,14 @@ from kaggle_ptcg_engine.ptcg.cg.game import (
     battle_start,
     visualize_data,
 )
+from methods.deck_prediction.hidden_card_sampler import SimpleSampler
 from player import Player
 from transformer_mcts import transformer
-from transformer_mcts.mcts import mcts_agent
+from transformer_mcts.mcts import ISMCTSPlayer
 
 # --- Configuration Constants ---
 RUN_NAME = "fresh"
-PRETRAIN_WEIGHTS_PATH = Path("results/imitated.pt")
+PRETRAIN_WEIGHTS_PATH = None  # Path("results/imitated.pt")
 # Number of epochs to run imitation learning before switching to MCTS
 IMITATION_EPOCHS = 0
 SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
@@ -44,7 +46,7 @@ ENTROPY_COEF = 0.02
 VALUE_LOSS_WEIGHT = 10
 TOTAL_EPOCHS = 500
 TRAIN_ITERATIONS = 100
-VAL_ITERATIONS = 50
+VAL_ITERATIONS = 0
 
 
 # Helper class to construct batch inputs for the neural network.
@@ -120,7 +122,7 @@ def play_and_collect_samples(player1: Player, player2: Player):
         vis[i]["obs"] = obs_log[i]
         vis[i]["action"] = [action_log[i], action_log[i]]
     battle_finish()
-    return samples, action_log, obs_log, obs, vis
+    return samples, action_log, obs_log, to_observation_class(obs), vis
 
 
 # Environment setup structures
@@ -181,23 +183,18 @@ elo_data_path = results_dir / "elo.json"
 
 
 # ----- Players definition -----
-class MCTSAgentWrapper:
-    def __init__(
-        self, model: transformer.MyModel, deck: list[int], is_eval: bool = False
-    ):
-        self.model = model
-        self.deck = deck
-        self.is_eval = is_eval
-
-    def __call__(self, obs):
-        return mcts_agent(obs, self.deck, self.model, is_eval=self.is_eval)
-
 
 player1_deck = mega_lucario_ex_deck
 
-player1_mcts = MCTSAgentWrapper(model, player1_deck, is_eval=False)
 
-player1 = Player(model=player1_mcts, name="model", deck=player1_deck, is_trainable=True)
+player1 = ISMCTSPlayer(
+    model=model,
+    name="ismcts",
+    deck=player1_deck,
+    sampler=SimpleSampler(mega_lucario_ex_deck),
+    sample_count=3,
+    search_count_per_sample=50,
+)
 
 
 def player_lucario_agent(*args, **kwargs):
@@ -215,7 +212,7 @@ if __name__ == "__main__":
     if model_path.exists():
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(model_path, weights_only=False))
-    elif PRETRAIN_WEIGHTS_PATH.exists():
+    elif PRETRAIN_WEIGHTS_PATH is not None and PRETRAIN_WEIGHTS_PATH.exists():
         print("❇️Restoring", model_path)
         model.load_state_dict(torch.load(PRETRAIN_WEIGHTS_PATH, weights_only=False))
 
@@ -246,9 +243,10 @@ if __name__ == "__main__":
         val_partner = player_lucario
 
         model.eval()
+        player1.is_eval = True
         with torch.inference_mode():
             # Evaluation Phase
-            player1_mcts.is_eval = True
+            player1.is_eval = True
 
             results = [0, 0, 0]
             start_time = time.perf_counter()
@@ -305,7 +303,7 @@ if __name__ == "__main__":
             elo.save_json(elo_data_path)
 
             # Data Generation / Training Sampling Phase
-            player1_mcts.is_eval = False
+            player1.is_eval = False
             results_train = [0, 0, 0]
             async_train_results = []
             for _ in range(TRAIN_ITERATIONS):
@@ -352,12 +350,10 @@ if __name__ == "__main__":
 
                 for i in range(2):
                     LAMBDA = 0.95
-                    if game_result["current"]["result"] == 2:
+                    if game_result.current.result == 2:
                         final_outcome = 0.0
                     else:
-                        final_outcome = (
-                            1.0 if i == game_result["current"]["result"] else -1.0
-                        )
+                        final_outcome = 1.0 if i == game_result.current.result else -1.0
 
                     current_value = final_outcome
                     for sample in reversed(samples[i]):
@@ -379,6 +375,7 @@ if __name__ == "__main__":
 
         # Gradient Optimization Step Phase
         model.train()
+        player1.is_eval = False
         random.shuffle(sample_list)
         batch_count = len(sample_list) // BATCH_SIZE
 
