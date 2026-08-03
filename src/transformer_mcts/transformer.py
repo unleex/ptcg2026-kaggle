@@ -166,39 +166,33 @@ class SparseVector:
         self.offset.append(len(self.index))
 
 
-def sanitize_id(card_id: int, sanitize_placeholders: bool) -> int:
-    # If we are sanitizing, map MCTS dummy card IDs (1 and 1072) to the sentinel token
-    if sanitize_placeholders and card_id in (1, 1072):
-        return SENTINEL_UNK
-    return card_id
-
-
 # 3. Update the encoder helper functions to respect sanitization
-def add_card(sv: SparseVector, card: Card | Pokemon | None, sanitize: bool = False):
+def add_card(
+    sv: SparseVector,
+    card: Card | Pokemon | None,
+):
     if card is not None:
-        sv.add(sanitize_id(card.id, sanitize), 1)
+        sv.add(card.id, 1)
     sv.add_pos(card_count)
 
 
-def add_cards(
-    sv: SparseVector, cards: list[Card] | None, value: float, sanitize: bool = False
-):
+def add_cards(sv: SparseVector, cards: list[Card] | None, value: float):
     if cards is not None:
         for card in cards:
-            sv.add(sanitize_id(card.id, sanitize), value)
+            sv.add(card.id, value)
     sv.add_pos(card_count)
 
 
-def add_pokemon(sv: SparseVector, poke: Pokemon | None, sanitize: bool = False):
+def add_pokemon(sv: SparseVector, poke: Pokemon | None):
     if poke is None:
         sv.add_single(1)
         sv.add_pos(1 + 3 * card_count)
     else:
         sv.add_single(0)
         sv.add_single(poke.hp / 400)
-        add_card(sv, poke, sanitize)
-        add_cards(sv, poke.tools, 1.0, sanitize)
-        add_cards(sv, poke.energyCards, 0.5, sanitize)
+        add_card(sv, poke)
+        add_cards(sv, poke.tools, 1.0)
+        add_cards(sv, poke.energyCards, 0.5)
 
 
 # Add encoder player feature
@@ -235,7 +229,7 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
             pos = sv.pos
             if j < len(ps.bench):
                 # Bench is public; no sanitization needed
-                add_pokemon(sv, ps.bench[j], sanitize=False)
+                add_pokemon(sv, ps.bench[j])
             else:
                 add_pokemon(sv, None)
             if j != 7:  # Not last
@@ -246,7 +240,7 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
         sv.word_start()
         if 0 < len(ps.active):
             # Active is public; no sanitization needed
-            add_pokemon(sv, ps.active[0], sanitize=False)
+            add_pokemon(sv, ps.active[0])
         else:
             add_pokemon(sv, None)
 
@@ -257,16 +251,11 @@ def get_encoder_input(obs: Observation, your_deck: list[int]) -> SparseVector:
         add_player(sv, ps)
 
     sv.word_start()
-    # Sanitize our hand if the encoder is viewing from the opponent's simulated perspective
-    add_cards(
-        sv, state.players[your_index].hand, 0.25, sanitize=is_opponent_perspective
-    )
+    add_cards(sv, state.players[your_index].hand, 0.25)
 
     sv.word_start()
     for id in your_deck:
-        # Sanitize our deck list if evaluated from the opponent's simulated perspective
-        actual_id = sanitize_id(id, sanitize_placeholders=is_opponent_perspective)
-        sv.add(actual_id, 0.25)
+        sv.add(id, 0.25)
     sv.add_pos(card_count)
 
     sv.word_start()

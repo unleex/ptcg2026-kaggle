@@ -36,8 +36,8 @@ from transformer_mcts import transformer
 from transformer_mcts.mcts import ISMCTSPlayer
 
 # --- Configuration Constants ---
-RUN_NAME = "fresh"
-PRETRAIN_WEIGHTS_PATH = None  # Path("results/imitated.pt")
+RUN_NAME = "ismcts_test"
+PRETRAIN_WEIGHTS_PATH = Path("results/imitated.pt")
 # Number of epochs to run imitation learning before switching to MCTS
 IMITATION_EPOCHS = 0
 SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
@@ -192,8 +192,8 @@ player1 = ISMCTSPlayer(
     name="ismcts",
     deck=player1_deck,
     sampler=SimpleSampler(mega_lucario_ex_deck),
-    sample_count=3,
-    search_count_per_sample=50,
+    sample_count=5,
+    search_count_per_sample=70,
 )
 
 

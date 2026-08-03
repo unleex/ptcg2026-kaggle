@@ -16,6 +16,8 @@ from player import Player
 from transformer_mcts import transformer
 from utils.utils import get_public_cards
 
+SEARCH_COUNT = 70
+
 
 # MCTS Node Child
 class Child:
@@ -59,7 +61,6 @@ def create_node(
     search_state: SearchState,
     your_index: int,
     your_deck: list[int],
-    opponents_deck: list[int],
     model: transformer.MyModel,
 ) -> tuple[Node, transformer.LearnSample | None]:
     node = Node(parent, search_state)
@@ -92,15 +93,14 @@ def create_node(
                 break
 
         # Determine which deck to pass based on who is active in this simulation step
-        # FIXME: opponents_deck's size changes from the root node!
-        # XXX: current fix is a crutch
         if obs.current.yourIndex == your_index:
             current_deck = your_deck
         else:
-            current_deck = opponents_deck[
-                : obs.current.players[obs.current.yourIndex].deckCount
-            ]
-            random.shuffle(current_deck)
+            # Use the simulated Snorlax deck we initialized in search_begin.
+            opponent_active_index = obs.current.yourIndex
+            current_deck = [transformer.SENTINEL_UNK] * obs.current.players[
+                opponent_active_index
+            ].deckCount
 
         sv_enc = transformer.get_encoder_input(obs, current_deck)
         sv_dec = transformer.get_decoder_input(obs, actions)
@@ -161,22 +161,30 @@ class ISMCTSPlayer(Player):
         obs = to_observation_class(obs_dict)
         your_index = obs.current.yourIndex
         state = obs.current
-        aggregated_value = 0
+
         aggregated_visits = {}
+        aggregated_value = 0.0
+        final_sample = None
+        root_actions = []
+
         for sample_idx in range(self.sample_count):
+            # 1. Sample decks/prizes
             your_public_cards = get_public_cards(player_state=state.players[your_index])
             stadium_card = state.stadium
             if stadium_card and stadium_card[0].playerIndex == your_index:
-                your_public_cards.append(stadium_card[0].id)
+                your_public_cards.append(stadium_card.id)
+
             remaining = Counter(your_deck) - Counter(your_public_cards)
             your_sampled_deck = random.sample(
-                list(remaining.elements()), state.players[your_index].deckCount
+                remaining.elements(), state.players[your_index].deckCount
             )
             remaining -= Counter(your_sampled_deck)
             your_sampled_prize = random.sample(
-                list(remaining.elements()), len(state.players[your_index].prize)
-            )
+                remaining.elements(), len(state.players[your_index].prize)
+            )  # Fixed trailing comma
+
             opp_cards = self.sampler.sample_opponent(obs)
+
             search_state = search_begin(
                 obs,
                 your_deck=your_sampled_deck,
@@ -186,23 +194,20 @@ class ISMCTSPlayer(Player):
                 opponent_hand=opp_cards["hand"],
                 opponent_active=opp_cards["hidden_active"],
             )
-            root, sample = create_node(
-                parent=None,
-                search_state=search_state,
-                your_index=your_index,
-                your_deck=your_deck,
-                opponents_deck=opp_cards["deck"],
-                model=model,
-            )
+
+            root, sample = create_node(None, search_state, your_index, your_deck, model)
+
+            # Track actions on first pass
             if sample_idx == 0:
                 final_sample = sample
                 root_actions = [tuple(c.select) for c in root.children]
                 for action in root_actions:
                     aggregated_visits[action] = 0
+
+            # Apply Dirichlet noise to root children during self-play
             if not is_eval and len(root.children) > 1:
                 DIRICHLET_ALPHA = 0.3
                 EXPLORATION_FRACTION = 0.25
-
                 noise = (
                     torch.distributions.dirichlet.Dirichlet(
                         torch.full((len(root.children),), DIRICHLET_ALPHA)
@@ -210,19 +215,18 @@ class ISMCTSPlayer(Player):
                     .sample()
                     .tolist()
                 )
-
                 for i, child in enumerate(root.children):
                     child.prob = (
                         child.prob * (1 - EXPLORATION_FRACTION)
                         + noise[i] * EXPLORATION_FRACTION
                     )
 
-            # Search
+            # 2. Run MCTS iterations for this sample
             for _ in range(self.search_count_per_sample):
                 current = root
                 while True:
                     value = -1e9
-                    c = 0.4 * math.sqrt(current.visit)
+                    c = self.c_puct * math.sqrt(current.visit)
                     for child in current.children:
                         visit = 0
                         if child.node is None:
@@ -235,38 +239,23 @@ class ISMCTSPlayer(Player):
                         v += c * child.prob / (1 + visit)
                         if value < v:
                             value = v
-                            next = child
+                            next_child = child
 
-                    if next.node is None:
-                        search_state = search_step(current.state.searchId, next.select)
-                        next.node, _ = create_node(
-                            parent=current,
-                            search_state=search_state,
-                            your_index=your_index,
-                            your_deck=your_deck,
-                            opponents_deck=opp_cards["deck"],
-                            model=model,
+                    if next_child.node is None:
+                        step_state = search_step(
+                            current.state.searchId, next_child.select
+                        )
+                        next_child.node, _ = create_node(
+                            current, step_state, your_index, your_deck, model
                         )
                         break
                     else:
-                        current = next.node
+                        current = next_child.node
                         if current.state.observation.current.result >= 0:
                             current.backprop(current.value)
                             break
 
-            # Generate training data
-            sample.value = root.total / root.visit
-            visits = [
-                child.node.visit if child.node is not None else 0
-                for child in root.children
-            ]
-            sum_visits = sum(visits)
-            if sum_visits > 0:
-                for i in range(len(root.children)):
-                    sample.policy[i] = visits[i] / sum_visits
-            else:
-                for i in range(len(root.children)):
-                    sample.policy[i] = 1.0 / len(root.children)
+            # 3. Accumulate visits and root value across determinizations
             for child in root.children:
                 if child.node is not None:
                     action_tuple = tuple(child.select)
@@ -277,16 +266,23 @@ class ISMCTSPlayer(Player):
                 aggregated_value += root.total / root.visit
 
             search_end()
-        best_action = max(aggregated_visits, key=aggregated_visits.get)
+
+        # 4. Final choice & policy target generation
+        best_action = list(max(aggregated_visits, key=aggregated_visits.get))
         total_visits = sum(aggregated_visits.values())
+
+        final_sample.value = aggregated_value / self.sample_count
+
         if total_visits > 0:
             for i, action in enumerate(root_actions):
                 final_sample.policy[i] = aggregated_visits[action] / total_visits
         else:
             for i in range(len(root_actions)):
                 final_sample.policy[i] = 1.0 / len(root_actions)
-        # final_sample.value = aggregated_value
-        return (list(best_action), final_sample)
+
+        return (best_action, final_sample)
 
     def __call__(self, obs):
-        return self.mcts_agent(obs, self.deck, self.model, self.is_eval)
+        return self.mcts_agent(
+            obs_dict=obs, your_deck=self.deck, model=self.model, is_eval=self.is_eval
+        )
