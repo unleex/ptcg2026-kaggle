@@ -203,12 +203,12 @@ CARD_TYPE_WEIGHTS = {
     # Trainer Cards & Energy
     # Specific engines indicate exact archetypes; generic staples give little info.
     # -------------------------------------------------------------------------
-    CardKind.STADIUM: 2.0,  # Core engine stadiums (e.g., Area Zero Underdepths)
+    CardKind.STADIUM: 1.7,  # Core engine stadiums (e.g., Area Zero Underdepths)
     CardKind.SPECIAL_ENERGY: 2.0,  # Tech/engine energies (e.g., Neo Upper, Jet Energy)
     CardKind.SUPPORTER: 1.5,  # Deck-specific Supporters vs. general draw power
     CardKind.TOOL: 1.2,  # Specialized attachments (e.g., Hero's Cape, TM Evolution)
     CardKind.ITEM: 1.0,  # Generic search items (Nest Ball, Ultra Ball appear everywhere)
-    CardKind.BASIC_ENERGY: 0.5,  # Lowest info value; nearly every deck runs basic energy types
+    CardKind.BASIC_ENERGY: 1.0,  # Lowest info value; nearly every deck runs basic energy types
 }
 
 player1 = ISMCTSPlayer(
