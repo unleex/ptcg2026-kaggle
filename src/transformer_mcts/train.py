@@ -10,6 +10,8 @@ import torch.optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
+import decks
+import kaggle_ptcg_engine.ptcg.cg.api
 import wandb
 from agents.rule_based_lucario import (
     agent as rule_based_lucario_agent,
@@ -19,31 +21,26 @@ from agents.rule_based_lucario import (
 )
 from cg.api import to_observation_class
 from elo import EloRating
-from kaggle_ptcg_engine.ptcg.cg.api import (
-    SelectContext,
-    all_attack,
-    all_card_data,
-)
 from kaggle_ptcg_engine.ptcg.cg.game import (
     battle_finish,
     battle_select,
     battle_start,
     visualize_data,
 )
-from methods.deck_prediction.hidden_card_sampler import SimpleSampler
+from methods.hidden_state_resolution.card_sampler import SoftWeightBayesianFilterSampler
 from player import Player
 from transformer_mcts import transformer
-from transformer_mcts.mcts import ISMCTSPlayer
+from transformer_mcts.ismcts import ISMCTSPlayer
+from utils.utils import CARD_ID_TO_KIND, CardKind
 
 # --- Configuration Constants ---
-RUN_NAME = "ismcts_test"
+RUN_NAME = "bayesian_sampler"
 PRETRAIN_WEIGHTS_PATH = Path("results/imitated.pt")
 # Number of epochs to run imitation learning before switching to MCTS
 IMITATION_EPOCHS = 0
 SELF_PLAY_CLONE_UPDATE_WINRATE_THRESH = 55
 BATCH_SIZE = 128
 ENTROPY_COEF = 0.02
-VALUE_LOSS_WEIGHT = 10
 TOTAL_EPOCHS = 500
 TRAIN_ITERATIONS = 100
 VAL_ITERATIONS = 0
@@ -133,13 +130,14 @@ weights_dir.mkdir(exist_ok=True)
 vis_savedir = results_dir / Path("visuals")
 vis_savedir.mkdir(exist_ok=True)
 # Load all card data from the API's helper function
-all_card = all_card_data()
+all_card = kaggle_ptcg_engine.ptcg.cg.api.all_card_data()
 # Create a lookup table (dictionary) to quickly access card data by its cardId
 card_table = {c.cardId: c for c in all_card}
 card_count = max(all_card, key=lambda c: c.cardId).cardId + 1  # Max Card ID + 1
 
 attack_count = (
-    max(all_attack(), key=lambda a: a.attackId).attackId + 1
+    max(kaggle_ptcg_engine.ptcg.cg.api.all_attack(), key=lambda a: a.attackId).attackId
+    + 1
 )  # Max Attack ID + 1
 
 num_words_encoder = 24
@@ -152,7 +150,12 @@ decoder_card_offset = (
 )  # First index of Card Feature
 decoder_size = (
     decoder_card_offset
-    + (1 + decoder_main_feature + SelectContext.RECOVER_SPECIAL_CONDITION) * card_count
+    + (
+        1
+        + decoder_main_feature
+        + kaggle_ptcg_engine.ptcg.cg.api.SelectContext.RECOVER_SPECIAL_CONDITION
+    )
+    * card_count
 )  # Decoder input vocabulary size
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,11 +190,39 @@ elo_data_path = results_dir / "elo.json"
 player1_deck = mega_lucario_ex_deck
 
 
+# Default role importance weights for Bayesian deck filtering
+CARD_TYPE_WEIGHTS = {
+    # -------------------------------------------------------------------------
+    # Pokémon Stages & Multi-Prize Rules
+    # Higher stages and specific multi-prizers usually define the deck archetype.
+    # -------------------------------------------------------------------------
+    CardKind.STAGE2_POKEMON: 3.0,  # Evolutionary line engines (e.g., Charizard ex, Gardevoir ex)
+    CardKind.STAGE1_POKEMON: 2.2,  # Mid-stage engine setup or main attackers
+    CardKind.BASIC_POKEMON: 1.2,  # Basic Pokémon (higher if unique, lower if staple bench sitters)
+    # -------------------------------------------------------------------------
+    # Trainer Cards & Energy
+    # Specific engines indicate exact archetypes; generic staples give little info.
+    # -------------------------------------------------------------------------
+    CardKind.STADIUM: 2.0,  # Core engine stadiums (e.g., Area Zero Underdepths)
+    CardKind.SPECIAL_ENERGY: 2.0,  # Tech/engine energies (e.g., Neo Upper, Jet Energy)
+    CardKind.SUPPORTER: 1.5,  # Deck-specific Supporters vs. general draw power
+    CardKind.TOOL: 1.2,  # Specialized attachments (e.g., Hero's Cape, TM Evolution)
+    CardKind.ITEM: 1.0,  # Generic search items (Nest Ball, Ultra Ball appear everywhere)
+    CardKind.BASIC_ENERGY: 0.5,  # Lowest info value; nearly every deck runs basic energy types
+}
+
 player1 = ISMCTSPlayer(
     model=model,
     name="ismcts",
     deck=player1_deck,
-    sampler=SimpleSampler(mega_lucario_ex_deck),
+    sampler=SoftWeightBayesianFilterSampler(
+        deck_pool=[decks.alakazam_deck, decks.ionos_deck, decks.mega_lucario_ex_deck],
+        deck_names=["alakazam", "ionos", "lucario"],
+        card_role_weights={
+            card_id: CARD_TYPE_WEIGHTS[kind]
+            for card_id, kind in CARD_ID_TO_KIND.items()
+        },
+    ),
     sample_count=5,
     search_count_per_sample=70,
 )
@@ -444,7 +475,7 @@ if __name__ == "__main__":
                 .mean()
             )
 
-            loss = (loss_enc * VALUE_LOSS_WEIGHT) + loss_dec - (ENTROPY_COEF * entropy)
+            loss = (loss_enc) + loss_dec - (ENTROPY_COEF * entropy)
 
             epoch_loss_enc += loss_enc.item()
             epoch_loss_dec += loss_dec.item()

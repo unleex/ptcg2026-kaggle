@@ -143,12 +143,10 @@ class ISMCTSPlayer(Player):
         self.is_eval = False
 
     def reset(self):
-        if hasattr(self.sampler, "reset"):
-            self.sampler.reset()
+        self.sampler.reset()
 
     def process_obs(self, obs):
-        if hasattr(self.sampler, "update"):
-            self.sampler.update(obs)
+        self.sampler.update(obs)
 
     # We will perform exploration using MCTS and select actions. At the same time, we will also generate training data.
     def mcts_agent(

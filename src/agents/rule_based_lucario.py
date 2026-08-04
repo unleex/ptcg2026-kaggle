@@ -2,13 +2,13 @@ from collections import defaultdict
 
 from cg.api import (
     AreaType,
+    Card,
     CardType,
     EnergyType,
     Observation,
-    SelectContext,
     OptionType,
-    Card,
     Pokemon,
+    SelectContext,
     all_card_data,
     to_observation_class,
 )
@@ -231,7 +231,7 @@ def agent(obs_dict: dict) -> list[int]:
         if card.id == Makuhita or card.id == Hariyama:
             if len(card.energies) >= 3:
                 attacker2 = True
-        elif card.id == Riolu or card.id == Mega_Lucario_ex:
+        elif card.id == Riolu or card.id == Mega_Lucario_ex:  # noqa: SIM102
             if len(card.energies) >= 2:
                 attacker1 = True
 
@@ -270,10 +270,10 @@ def agent(obs_dict: dict) -> list[int]:
 
         my_cards = [my_state.active[0]]
         for pokemon in my_state.bench:
-            my_cards.append(pokemon)
+            my_cards.append(pokemon)  # noqa: PERF402
         op_cards = [op_state.active[0]]
         for pokemon in op_state.bench:
-            op_cards.append(pokemon)
+            op_cards.append(pokemon)  # noqa: PERF402
 
         if state.turn >= 2:
             best_score = -1
@@ -505,7 +505,7 @@ def agent(obs_dict: dict) -> list[int]:
                 if card.id == Lunatone or card.id == Solrock:
                     if field_counts[card.id] >= 1:
                         score = -1
-                elif card.id == Riolu:
+                elif card.id == Riolu:  # noqa: SIM102
                     if field_counts[card.id] + field_counts[Mega_Lucario_ex] >= 2:
                         score = -1
             else:
@@ -538,9 +538,8 @@ def agent(obs_dict: dict) -> list[int]:
                     score = 3000
                 elif card.id == Lillie_Determination:
                     score = 3100
-                elif card.id == Gravity_Mountain:
-                    if stadium_id == 0:
-                        score = -1
+                elif card.id == Gravity_Mountain and stadium_id == 0:
+                    score = -1
         elif o.type == OptionType.ATTACH:
             card = get_card(obs, AreaType.HAND, o.index, my_index)
             pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)

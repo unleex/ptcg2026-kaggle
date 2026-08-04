@@ -6,6 +6,10 @@ class OpponentCardTracker:
         self.seen_cards: dict[int, int] = {}
         self.hand_cards: dict[int, int] = {}
 
+    def reset(self):
+        self.seen_cards = {}
+        self.hand_cards = {}
+
     def update(self, obs: Observation):
         if obs.current is None:
             return
