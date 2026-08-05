@@ -3,7 +3,9 @@ import random
 import typing
 from collections import Counter
 
+import ray
 import torch
+from ray import serve
 
 from cg.api import (
     SearchState,
@@ -61,6 +63,7 @@ def create_node(
     your_deck: list[int],
     opponents_deck: list[int],
     model: transformer.MyModel,
+    batched_inference: bool = False,
 ) -> tuple[Node, transformer.LearnSample | None]:
     node = Node(parent, search_state)
 
@@ -104,7 +107,12 @@ def create_node(
 
         sv_enc = transformer.get_encoder_input(obs, current_deck)
         sv_dec = transformer.get_decoder_input(obs, actions)
-        value, policy = transformer.eval_nn(sv_enc, sv_dec, model)
+        if batched_inference:
+            value, policy = (
+                serve.get_app_handle("model").remote((sv_enc, sv_dec)).result()
+            )
+        else:
+            value, policy = transformer.eval_nn(sv_enc, sv_dec, model)
         v = value
         if state.yourIndex != your_index:
             v = -v
@@ -134,6 +142,7 @@ class ISMCTSPlayer(Player):
         search_count_per_sample: int = 10,
         c_puct: float = 0.4,
         is_trainable: bool = True,
+        batched_inference: bool = False,
     ):
         super().__init__(model=model, name=name, deck=deck, is_trainable=is_trainable)
         self.sampler = sampler
@@ -141,6 +150,7 @@ class ISMCTSPlayer(Player):
         self.search_count_per_sample = search_count_per_sample
         self.c_puct = c_puct
         self.is_eval = False
+        self.batched_inference = batched_inference
 
     def reset(self):
         self.sampler.reset()
@@ -191,6 +201,7 @@ class ISMCTSPlayer(Player):
                 your_deck=your_deck,
                 opponents_deck=opp_cards["deck"],
                 model=model,
+                batched_inference=self.batched_inference,
             )
             if sample_idx == 0:
                 final_sample = sample
@@ -244,6 +255,7 @@ class ISMCTSPlayer(Player):
                             your_deck=your_deck,
                             opponents_deck=opp_cards["deck"],
                             model=model,
+                            batched_inference=self.batched_inference,
                         )
                         break
                     else:

@@ -3,6 +3,7 @@ import random
 import time
 from pathlib import Path
 
+import ray
 import torch
 import torch.multiprocessing as mp
 import torch.nn
@@ -11,7 +12,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 import decks
-import kaggle_ptcg_engine.ptcg.cg.api
 import wandb
 from agents.rule_based_lucario import (
     agent as rule_based_lucario_agent,
@@ -21,6 +21,7 @@ from agents.rule_based_lucario import (
 )
 from cg.api import to_observation_class
 from elo import EloRating
+from inference.inference_server import create_handle
 from kaggle_ptcg_engine.ptcg.cg.game import (
     battle_finish,
     battle_select,
@@ -59,6 +60,7 @@ class LearnInput:
             self.offset.append(o + count)
 
 
+@ray.remote
 def play_and_collect_samples(player1: Player, player2: Player):
     """Play one game and return obtained LearnSamples."""
     if hasattr(player1.model, "reset"):
@@ -75,7 +77,7 @@ def play_and_collect_samples(player1: Player, player2: Player):
     samples: list[list[transformer.LearnSample]] = [[], []]
     while True:
         if obs["current"]["result"] >= 0:
-            print("done", end=" ")
+            print("done")
             break
         your_index = obs["current"]["yourIndex"]
         if your_index == 0:
@@ -129,24 +131,18 @@ def generate_samples(
         elo.register(partner_player.name)
 
         player1_goes_first = random.random() < 0.5
-        async_results.append(
-            (
-                pool.apply_async(
-                    play_and_collect_samples,
-                    args=(player1, partner_player)
-                    if player1_goes_first
-                    else (partner_player, player1),
-                ),
-                player1_goes_first,
-            )
+        task_ref = play_and_collect_samples.remote(
+            player1 if player1_goes_first else partner_player,
+            partner_player if player1_goes_first else player1,
         )
+        async_results.append((task_ref, player1_goes_first))
 
     sample_list: list[transformer.LearnSample] = []
     total_samples = 0
     start_time = time.perf_counter()
     pbar = tqdm(async_results, desc=f"Collecting Data Epoch {epoch}...")
-    for async_res, player1_goes_first in pbar:
-        samples, _, _, game_result, vis = async_res.get()
+    for task_ref, player1_goes_first in pbar:
+        samples, _, _, game_result, vis = ray.get(task_ref)
 
         with open(
             vis_savedir / f"vis_train_{epoch}_{len(list(vis_savedir.iterdir()))}.json",
@@ -387,6 +383,7 @@ def main():
         ),
         sample_count=5,
         search_count_per_sample=70,
+        batched_inference=True,
     )
 
     player_lucario = Player(
@@ -410,6 +407,8 @@ def main():
     for _ in range(start_epoch):
         lr_scheduler.step()
 
+    create_handle()
+    ray.logger.setLevel("WARN")
     for epoch in range(start_epoch, TOTAL_EPOCHS):
         print(f"\n--- Epoch {epoch}: Data Collection ---", flush=True)
         samples, train_win_rate, sps = generate_samples(
